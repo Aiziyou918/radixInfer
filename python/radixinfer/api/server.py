@@ -5,6 +5,8 @@ import json
 import multiprocessing as mp
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from queue import Empty, Queue
+from typing import Any
 
 try:
     from fastapi import FastAPI, Request
@@ -19,9 +21,15 @@ except ModuleNotFoundError:
         pass
 
 from radixinfer.config import ServerConfig
-from radixinfer.runtime.scheduler import start_runtime_process
-from radixinfer.transport.protocol import AbortRequest, SamplingParams, StreamChunk, TokenizeRequest
-from radixinfer.transport.tokenizer_worker import start_tokenizer_process
+from radixinfer.runtime.scheduler import SchedulerRuntime, start_runtime_process
+from radixinfer.transport.protocol import (
+    AbortRequest,
+    SamplingParams,
+    StreamChunk,
+    TokenizeRequest,
+    TokenizedRequest,
+)
+from radixinfer.transport.tokenizer_worker import create_tokenizer_backend, start_tokenizer_process
 
 
 class ChatMessage(BaseModel):
@@ -44,16 +52,31 @@ class ChatCompletionRequest(BaseModel):
 @dataclass
 class AppState:
     config: ServerConfig
-    tokenizer_ingress: mp.Queue = field(default_factory=mp.Queue)
-    runtime_ingress: mp.Queue = field(default_factory=mp.Queue)
-    frontend_queue: mp.Queue = field(default_factory=mp.Queue)
+    tokenizer_ingress: Any = field(default_factory=mp.Queue)
+    runtime_ingress: Any = field(default_factory=mp.Queue)
+    frontend_queue: Any = field(default_factory=mp.Queue)
     request_counter: int = 0
     tokenizer_process: mp.Process | None = None
     runtime_process: mp.Process | None = None
     listeners: dict[int, asyncio.Queue[StreamChunk]] = field(default_factory=dict)
     listen_task: asyncio.Task | None = None
+    inline_runtime: SchedulerRuntime | None = None
+    inline_tokenizer: Any | None = None
+    inline_tasks: set[asyncio.Task] = field(default_factory=set)
+
+    @property
+    def inline_mode(self) -> bool:
+        return self.config.start_method == "inline"
 
     def start(self) -> None:
+        if self.inline_mode:
+            self.inline_tokenizer = create_tokenizer_backend(self.config.tokenizer_name or self.config.model)
+            self.inline_runtime = SchedulerRuntime(
+                self.config,
+                self.runtime_ingress,
+                self.tokenizer_ingress,
+            )
+            return
         if self.tokenizer_process is None:
             self.tokenizer_process = start_tokenizer_process(
                 self.tokenizer_ingress,
@@ -69,6 +92,8 @@ class AppState:
             )
 
     async def start_listener(self) -> None:
+        if self.inline_mode:
+            return
         if self.listen_task is None:
             self.listen_task = asyncio.create_task(self._listen_frontend())
 
@@ -86,6 +111,75 @@ class AppState:
         self.request_counter += 1
         return current
 
+    def submit_request(self, request_id: int, prompt: str, sampling: SamplingParams) -> None:
+        if self.inline_mode:
+            task = asyncio.create_task(self._run_inline_request(request_id, prompt, sampling))
+            self.inline_tasks.add(task)
+            task.add_done_callback(self.inline_tasks.discard)
+            return
+        self.tokenizer_ingress.put(
+            TokenizeRequest(
+                request_id=request_id,
+                prompt=prompt,
+                sampling=sampling,
+            )
+        )
+
+    async def abort_request(self, request_id: int) -> None:
+        self.runtime_ingress.put(AbortRequest(request_id=request_id))
+        if not self.inline_mode:
+            return
+        await self._pump_inline_runtime()
+
+    async def _run_inline_request(
+        self,
+        request_id: int,
+        prompt: str,
+        sampling: SamplingParams,
+    ) -> None:
+        assert self.inline_runtime is not None
+        assert self.inline_tokenizer is not None
+        self.runtime_ingress.put(
+            TokenizedRequest(
+                request_id=request_id,
+                token_ids=self.inline_tokenizer.encode(prompt),
+                sampling=sampling,
+                eos_token_id=getattr(self.inline_tokenizer, "eos_token_id", None),
+                stop_token_ids=getattr(self.inline_tokenizer, "stop_token_ids", ()),
+            )
+        )
+        while True:
+            done = await self._pump_inline_runtime()
+            if done.get(request_id, False):
+                return
+            await asyncio.sleep(self.config.scheduler_tick_interval)
+
+    async def _pump_inline_runtime(self) -> dict[int, bool]:
+        assert self.inline_runtime is not None
+        assert self.inline_tokenizer is not None
+        completed: dict[int, bool] = {}
+        self.inline_runtime._drain_ingress()
+        self.inline_runtime._tick()
+        while True:
+            try:
+                detok = self.tokenizer_ingress.get_nowait()
+            except Empty:
+                break
+            if detok is None:
+                continue
+            chunk = StreamChunk(
+                request_id=detok.request_id,
+                text=self.inline_tokenizer.decode_token(detok.token_id),
+                finished=detok.finished,
+                finish_reason=detok.finish_reason,
+            )
+            listener = self.listeners.get(chunk.request_id)
+            if listener is not None:
+                await listener.put(chunk)
+            if chunk.finished:
+                completed[chunk.request_id] = True
+        return completed
+
     async def collect_response(self, request_id: int, output_queue: asyncio.Queue[StreamChunk]) -> tuple[str, str]:
         parts: list[str] = []
         finish_reason = "stop"
@@ -99,6 +193,10 @@ class AppState:
         return "".join(parts), finish_reason
 
     async def shutdown(self) -> None:
+        if self.inline_tasks:
+            await asyncio.gather(*list(self.inline_tasks), return_exceptions=True)
+        if self.inline_mode:
+            return
         self.tokenizer_ingress.put(None)
         self.runtime_ingress.put(None)
         self.frontend_queue.put(None)
@@ -148,7 +246,15 @@ def _build_completion_payload(request_id: int, model: str, content: str, finish_
 def create_app(config: ServerConfig) -> FastAPI:
     if FastAPI is None or Request is None or StreamingResponse is None:
         raise RuntimeError("FastAPI dependencies are not installed. Install project dependencies first.")
-    state = AppState(config=config)
+    if config.start_method == "inline":
+        state = AppState(
+            config=config,
+            tokenizer_ingress=Queue(),
+            runtime_ingress=Queue(),
+            frontend_queue=Queue(),
+        )
+    else:
+        state = AppState(config=config)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -168,18 +274,16 @@ def create_app(config: ServerConfig) -> FastAPI:
         request_id = state.next_request_id()
         output_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
         state.listeners[request_id] = output_queue
-        state.tokenizer_ingress.put(
-            TokenizeRequest(
-                request_id=request_id,
-                prompt=_flatten_prompt(payload),
-                sampling=SamplingParams(
-                    max_tokens=payload.max_tokens,
-                    temperature=payload.temperature,
-                    top_k=payload.top_k,
-                    top_p=payload.top_p,
-                    ignore_eos=payload.ignore_eos,
-                ),
-            )
+        state.submit_request(
+            request_id,
+            _flatten_prompt(payload),
+            SamplingParams(
+                max_tokens=payload.max_tokens,
+                temperature=payload.temperature,
+                top_k=payload.top_k,
+                top_p=payload.top_p,
+                ignore_eos=payload.ignore_eos,
+            ),
         )
 
         if not payload.stream:
@@ -194,7 +298,7 @@ def create_app(config: ServerConfig) -> FastAPI:
             try:
                 while True:
                     if await request.is_disconnected():
-                        state.runtime_ingress.put(AbortRequest(request_id=request_id))
+                        await state.abort_request(request_id)
                         break
                     chunk = await output_queue.get()
                     delta = {}
