@@ -53,6 +53,8 @@ class SchedulerRuntime:
                     request_id=item.request_id,
                     prompt_tokens=item.token_ids,
                     sampling=item.sampling,
+                    eos_token_id=item.eos_token_id,
+                    stop_token_ids=item.stop_token_ids,
                 )
                 request.prefix_matched = self.prefix_store.match(item.token_ids).matched_tokens
                 self.requests[item.request_id] = request
@@ -133,7 +135,15 @@ class SchedulerRuntime:
             request.generated_tokens.append(token_id)
             finished = False
             finish_reason = "running"
-            if token_id in self.config.stop_token_ids:
+            request_stop_tokens = set(self.config.stop_token_ids).union(request.stop_token_ids)
+            if (
+                not request.sampling.ignore_eos
+                and request.eos_token_id is not None
+                and token_id == request.eos_token_id
+            ):
+                finished = True
+                finish_reason = "stop"
+            elif token_id in request_stop_tokens:
                 finished = True
                 finish_reason = "stop"
             elif request.remaining_tokens <= 0:

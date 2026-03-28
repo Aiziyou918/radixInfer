@@ -25,6 +25,8 @@ class TokenizedRequest:
     request_id: int
     token_ids: list[int]
     sampling: SamplingParams
+    eos_token_id: int | None = None
+    stop_token_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

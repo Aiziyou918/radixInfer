@@ -64,3 +64,55 @@ def test_decode_reports_length_finish_reason() -> None:
     message = runtime.tokenizer_queue.get(timeout=1.0)
     assert message.finished is True
     assert message.finish_reason == "length"
+
+
+def test_decode_respects_request_eos_token() -> None:
+    runtime = SchedulerRuntime(
+        ServerConfig(
+            model="debug",
+            engine_kind="dummy",
+            max_batch_size=1,
+        ),
+        Queue(),
+        Queue(),
+    )
+    req = RuntimeRequest(
+        request_id=3,
+        prompt_tokens=[1, 2],
+        sampling=SamplingParams(max_tokens=4, ignore_eos=False),
+        eos_token_id=5,
+        stop_token_ids=(),
+        phase=RequestPhase.READY_TO_DECODE,
+    )
+    runtime.requests[3] = req
+    runtime.engine.decode = lambda batch: type("Out", (), {"next_token_ids": [5]})()  # type: ignore[method-assign]
+    runtime._run_decode([3])
+    message = runtime.tokenizer_queue.get(timeout=1.0)
+    assert message.finished is True
+    assert message.finish_reason == "stop"
+
+
+def test_decode_can_ignore_eos_when_requested() -> None:
+    runtime = SchedulerRuntime(
+        ServerConfig(
+            model="debug",
+            engine_kind="dummy",
+            max_batch_size=1,
+        ),
+        Queue(),
+        Queue(),
+    )
+    req = RuntimeRequest(
+        request_id=4,
+        prompt_tokens=[1, 2],
+        sampling=SamplingParams(max_tokens=2, ignore_eos=True),
+        eos_token_id=5,
+        stop_token_ids=(),
+        phase=RequestPhase.READY_TO_DECODE,
+    )
+    runtime.requests[4] = req
+    runtime.engine.decode = lambda batch: type("Out", (), {"next_token_ids": [5]})()  # type: ignore[method-assign]
+    runtime._run_decode([4])
+    message = runtime.tokenizer_queue.get(timeout=1.0)
+    assert message.finished is False
+    assert message.finish_reason == "running"

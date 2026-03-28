@@ -13,6 +13,7 @@ class SimpleTokenizer:
         self._char_to_id: dict[str, int] = {}
         self._id_to_char: dict[int, str] = {}
         self._next_id = 1
+        self.eos_token_id = 0
 
     def encode(self, text: str) -> list[int]:
         result = []
@@ -30,6 +31,10 @@ class SimpleTokenizer:
             return ""
         return self._id_to_char.get(token_id, "?")
 
+    @property
+    def stop_token_ids(self) -> tuple[int, ...]:
+        return (self.eos_token_id,)
+
 
 class TransformersTokenizerAdapter:
     def __init__(self, model_name: str) -> None:
@@ -46,6 +51,22 @@ class TransformersTokenizerAdapter:
         if token_id not in self._cache:
             self._cache[token_id] = self.tokenizer.decode([token_id], skip_special_tokens=False)
         return self._cache[token_id]
+
+    @property
+    def eos_token_id(self) -> int | None:
+        return self.tokenizer.eos_token_id
+
+    @property
+    def stop_token_ids(self) -> tuple[int, ...]:
+        candidates = []
+        for token_id in (
+            self.tokenizer.eos_token_id,
+            self.tokenizer.sep_token_id,
+            self.tokenizer.pad_token_id,
+        ):
+            if token_id is not None:
+                candidates.append(int(token_id))
+        return tuple(dict.fromkeys(candidates))
 
 
 def create_tokenizer_backend(model_name: str | None) -> Any:
@@ -79,6 +100,8 @@ class TokenizerProcess:
                         request_id=message.request_id,
                         token_ids=tokenizer.encode(message.prompt),
                         sampling=message.sampling,
+                        eos_token_id=getattr(tokenizer, "eos_token_id", None),
+                        stop_token_ids=getattr(tokenizer, "stop_token_ids", ()),
                     )
                 )
             elif isinstance(message, DetokenizeRequest):

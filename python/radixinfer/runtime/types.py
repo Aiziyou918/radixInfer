@@ -21,6 +21,8 @@ class RuntimeRequest:
     request_id: int
     prompt_tokens: list[int]
     sampling: SamplingParams
+    eos_token_id: int | None = None
+    stop_token_ids: tuple[int, ...] = ()
     phase: RequestPhase = RequestPhase.WAIT_PREFILL
     generated_tokens: list[int] = field(default_factory=list)
     prefix_matched: int = 0
