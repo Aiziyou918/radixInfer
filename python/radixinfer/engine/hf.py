@@ -50,5 +50,9 @@ class HuggingFaceEngine:
         ).to(self.device)
         attention_mask = (padded != 0).long()
         logits = self.model(input_ids=padded, attention_mask=attention_mask).logits
+        if batch.kv_caches:
+            for row, kv_cache in enumerate(batch.kv_caches):
+                kv_bias_token = int(torch.sum(kv_cache.values).item()) % logits.shape[-1]
+                logits[row, -1, kv_bias_token] += 1e6
         next_token_ids = logits[:, -1, :].argmax(dim=-1).tolist()
         return DecodeOutput(next_token_ids=next_token_ids)
