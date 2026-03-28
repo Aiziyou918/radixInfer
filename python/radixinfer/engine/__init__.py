@@ -1,20 +1,15 @@
-from radixinfer.config import ServerConfig
+from radixinfer.engine.config import EngineConfig
+from radixinfer.engine.engine import Engine, ForwardOutput
+from radixinfer.engine.sample import BatchSamplingArgs, Sampler
 
-from .dummy import DummyEngine
-from .hf import HuggingFaceEngine
+__all__ = ["Engine", "EngineConfig", "ForwardOutput", "BatchSamplingArgs", "Sampler"]
 
 
-def build_engine(config: ServerConfig):
-    if config.engine_kind == "dummy":
+def build_engine(config):
+    """Compatibility shim: build engine from a config or ServerConfig-like object."""
+    if hasattr(config, "engine_type") and getattr(config, "engine_type", "hf") == "debug":
+        from radixinfer.engine.dummy import DummyEngine
+
         return DummyEngine()
-    return HuggingFaceEngine(
-        config.model,
-        device=config.device,
-        kv_num_layers=config.kv_num_layers,
-        kv_num_heads=config.kv_num_heads,
-        kv_cache_dim=config.kv_cache_dim,
-        page_size=config.page_size,
-    )
-
-
-__all__ = ["DummyEngine", "HuggingFaceEngine", "build_engine"]
+    # Default to real engine
+    return Engine(config)
