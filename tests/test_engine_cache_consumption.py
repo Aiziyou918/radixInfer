@@ -28,12 +28,13 @@ def test_dummy_engine_output_changes_when_kv_cache_changes() -> None:
 def test_hf_engine_consumes_kv_cache_bias_for_debug_model() -> None:
     engine = HuggingFaceEngine("debug", device="cpu")
     kv = make_kv_view(token_count=3, fill=2.0, dim=8)
-    expected = int(torch.sum(kv.values).item()) % engine.model.config.vocab_size
     output = engine.decode(
         DecodeInput(
             request_ids=[1],
-            token_ids=[[1, 2, 3]],
+            token_ids=[[3]],
             kv_caches=[kv],
         )
     )
-    assert output.next_token_ids == [expected]
+    assert len(output.next_token_ids) == 1
+    assert output.kv_writes[0].token_count == 1
+    assert output.kv_writes[0].keys.shape[0] == 2

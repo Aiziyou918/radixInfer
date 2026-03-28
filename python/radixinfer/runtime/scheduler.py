@@ -7,7 +7,7 @@ from queue import Empty
 from radixinfer.cache.page_pool import PagePool
 from radixinfer.cache.prefix_store import PrefixStore
 from radixinfer.config import ServerConfig
-from radixinfer.engine.base import DecodeInput
+from radixinfer.engine.base import DecodeInput, PrefillInput
 from radixinfer.engine import build_engine
 from radixinfer.runtime.planner import BatchPlanner
 from radixinfer.runtime.types import RequestPhase, RuntimeRequest
@@ -117,6 +117,14 @@ class SchedulerRuntime:
                         cached_prefix,
                         start_offset=0,
                     )
+                    prefix_kv = self.page_pool.read_kv(request.prefix_span)
+                    if prefix_kv.token_count > 0:
+                        request.cache_span = self.page_pool.write_kv(
+                            reservation,
+                            prefix_kv.keys,
+                            prefix_kv.values,
+                            start_offset=0,
+                        )
 
             chunk_tokens = min(request.remaining_prefill_tokens, remaining_budget)
             if chunk_tokens <= 0:
@@ -134,6 +142,26 @@ class SchedulerRuntime:
                     prefix_tokens[request.prefix_matched :],
                     start_offset=request.prefix_matched,
                 )
+                kv_prefix = (
+                    self.page_pool.read_kv(request.cache_span, token_count=request.prefix_matched)
+                    if request.cache_span is not None and request.prefix_matched > 0
+                    else None
+                )
+                prefill_output = self.engine.prefill(
+                    PrefillInput(
+                        request_ids=[request.request_id],
+                        token_ids=[prefix_tokens[request.prefix_matched :]],
+                        kv_caches=[kv_prefix] if kv_prefix is not None else [],
+                    )
+                )
+                if prefill_output.kv_writes:
+                    kv_write = prefill_output.kv_writes[0]
+                    cache_span = self.page_pool.write_kv(
+                        request.reservation,
+                        kv_write.keys,
+                        kv_write.values,
+                        start_offset=request.prefix_matched,
+                    )
                 request.cache_span = cache_span
                 request.prefix_span = cache_span
                 self.prefix_store.insert(prefix_tokens, cache_span)
@@ -156,14 +184,27 @@ class SchedulerRuntime:
         output = self.engine.decode(
             DecodeInput(
                 request_ids=[req.request_id for req in selected],
-                token_ids=[self.page_pool.read_span(req.cache_span) for req in selected],  # type: ignore[arg-type]
-                kv_caches=[self.page_pool.read_kv(req.cache_span) for req in selected],  # type: ignore[arg-type]
+                token_ids=[self.page_pool.read_span(req.cache_span)[-1:] for req in selected],  # type: ignore[arg-type]
+                kv_caches=[
+                    self.page_pool.read_kv(req.cache_span, token_count=max(0, req.cached_token_count - 1))
+                    for req in selected
+                ],  # type: ignore[arg-type]
             )
         )
-        for request, token_id in zip(selected, output.next_token_ids, strict=True):
+        kv_writes = getattr(output, "kv_writes", [None] * len(selected))
+        for request, token_id, kv_write in zip(
+            selected, output.next_token_ids, kv_writes, strict=True
+        ):
             request.generated_tokens.append(token_id)
             if request.reservation is None or request.cache_span is None:
                 raise RuntimeError("decode request is missing active cache state")
+            if kv_write is not None and kv_write.token_count > 0:
+                request.cache_span = self.page_pool.write_kv(
+                    request.reservation,
+                    kv_write.keys,
+                    kv_write.values,
+                    start_offset=max(0, request.cached_token_count - kv_write.token_count),
+                )
             request.cache_span = self.page_pool.write_tokens(
                 request.reservation,
                 [token_id],

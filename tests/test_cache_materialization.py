@@ -1,5 +1,7 @@
 from multiprocessing import Queue
 
+import torch
+
 from radixinfer.config import ServerConfig
 from radixinfer.runtime.scheduler import SchedulerRuntime
 from radixinfer.runtime.types import RuntimeRequest
@@ -149,5 +151,36 @@ def test_decode_input_carries_kv_cache_view() -> None:
 
     runtime.engine.decode = fake_decode  # type: ignore[method-assign]
     runtime._run_decode([3])
-    assert seen["token_ids"] == [[7, 8, 9, 10]]
-    assert seen["kv_shapes"] == [((3, 4, 2, 8), (3, 4, 2, 8))]
+    assert seen["token_ids"] == [[10]]
+    assert seen["kv_shapes"] == [((3, 3, 2, 8), (3, 3, 2, 8))]
+
+
+def test_prefill_writes_real_kv_into_page_pool_for_hf_debug_engine() -> None:
+    runtime = SchedulerRuntime(
+        ServerConfig(
+            model="debug",
+            engine_kind="hf",
+            device="cpu",
+            max_prefill_tokens=8,
+            max_batch_size=2,
+            page_size=2,
+            total_pages=16,
+            kv_cache_dim=16,
+            kv_num_layers=2,
+            kv_num_heads=4,
+        ),
+        Queue(),
+        Queue(),
+    )
+    req = RuntimeRequest(
+        request_id=4,
+        prompt_tokens=[7, 8, 9, 10],
+        sampling=SamplingParams(max_tokens=2),
+    )
+    runtime.requests[4] = req
+    runtime._run_prefill([4])
+    assert req.cache_span is not None
+    kv = runtime.page_pool.read_kv(req.cache_span)
+    assert kv.token_count == 4
+    assert torch.count_nonzero(kv.keys).item() > 0
+    assert torch.count_nonzero(kv.values).item() > 0

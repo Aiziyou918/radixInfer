@@ -97,7 +97,6 @@ class PagePool:
                     page_tokens[idx] = token
                 else:
                     page_tokens.append(token)
-                self._write_kv(page_id, idx, token)
             page_index += 1
             in_page_offset = 0
 
@@ -111,7 +110,8 @@ class PagePool:
             tokens.extend(self._page_data[page_id])
         return tokens[: span.token_count]
 
-    def read_kv(self, span: PageSpan) -> KVCacheView:
+    def read_kv(self, span: PageSpan, token_count: int | None = None) -> KVCacheView:
+        effective_count = span.token_count if token_count is None else min(token_count, span.token_count)
         used_pages = len(span.page_ids)
         page_index = list(span.page_ids)
         keys = self._key_cache[:, page_index].reshape(
@@ -127,10 +127,55 @@ class PagePool:
             self.kv_cache_dim,
         )
         return KVCacheView(
-            keys=keys[:, : span.token_count].clone(),
-            values=values[:, : span.token_count].clone(),
-            token_count=span.token_count,
+            keys=keys[:, :effective_count].clone(),
+            values=values[:, :effective_count].clone(),
+            token_count=effective_count,
         )
+
+    def write_kv(
+        self,
+        reservation: PageReservation,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        *,
+        start_offset: int = 0,
+    ) -> PageSpan:
+        if keys.shape != values.shape:
+            raise ValueError("keys and values must have the same shape")
+        if keys.ndim != 4:
+            raise ValueError("expected KV tensors with shape (layers, tokens, heads, dim)")
+        _, token_count, _, _ = keys.shape
+        end_offset = start_offset + token_count
+        if end_offset > reservation.capacity_tokens:
+            raise ValueError("KV write exceeds reservation capacity")
+        page_index = start_offset // self.page_size
+        in_page_offset = start_offset % self.page_size
+        remaining = token_count
+        src_offset = 0
+        layer_count = min(self.kv_num_layers, keys.shape[0])
+        head_count = min(self.kv_num_heads, keys.shape[2])
+        dim_count = min(self.kv_cache_dim, keys.shape[3])
+        while remaining > 0:
+            page_id = reservation.page_ids[page_index]
+            write_len = min(self.page_size - in_page_offset, remaining)
+            src_slice = slice(src_offset, src_offset + write_len)
+            dst_slice = slice(in_page_offset, in_page_offset + write_len)
+            self._key_cache[:, page_id, dst_slice].zero_()
+            self._value_cache[:, page_id, dst_slice].zero_()
+            self._key_cache[:layer_count, page_id, dst_slice, :head_count, :dim_count] = keys[
+                :layer_count, src_slice, :head_count, :dim_count
+            ].to(dtype=torch.float32)
+            self._value_cache[:layer_count, page_id, dst_slice, :head_count, :dim_count] = values[
+                :layer_count, src_slice, :head_count, :dim_count
+            ].to(dtype=torch.float32)
+            page_index += 1
+            in_page_offset = 0
+            src_offset += write_len
+            remaining -= write_len
+
+        reservation.committed_tokens = max(reservation.committed_tokens, end_offset)
+        used_pages = (reservation.committed_tokens + self.page_size - 1) // self.page_size
+        return PageSpan(page_ids=tuple(reservation.page_ids[:used_pages]), token_count=reservation.committed_tokens)
 
     def release(self, reservation: PageReservation) -> None:
         for page_id in reservation.page_ids:
@@ -139,11 +184,3 @@ class PagePool:
             self._value_cache[:, page_id].zero_()
         self._free_pages.extend(reservation.page_ids)
         self._free_pages.sort()
-
-    def _write_kv(self, page_id: int, slot: int, token: int) -> None:
-        base = torch.arange(self.kv_cache_dim, dtype=torch.float32)
-        for layer_id in range(self.kv_num_layers):
-            for head_id in range(self.kv_num_heads):
-                scale = float(token + layer_id * 10 + head_id)
-                self._key_cache[layer_id, page_id, slot, head_id] = base + scale
-                self._value_cache[layer_id, page_id, slot, head_id] = base * 0.5 + scale
