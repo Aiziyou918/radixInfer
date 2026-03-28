@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import time
 
+from radixinfer.config import ServerConfig
+from radixinfer.engine import build_engine
 from radixinfer.engine.base import DecodeInput
-from radixinfer.engine.dummy import DummyEngine
 
 
 def main() -> None:
@@ -12,9 +13,14 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--prompt-len", type=int, default=128)
     parser.add_argument("--steps", type=int, default=256)
+    parser.add_argument("--model", default="debug")
+    parser.add_argument("--engine", choices=["dummy", "hf"], default="hf")
+    parser.add_argument("--device", default="auto")
     args = parser.parse_args()
 
-    engine = DummyEngine()
+    engine = build_engine(
+        ServerConfig(model=args.model, engine_kind=args.engine, device=args.device)
+    )
     tokens = [list(range(args.prompt_len)) for _ in range(args.batch_size)]
     request_ids = list(range(args.batch_size))
 

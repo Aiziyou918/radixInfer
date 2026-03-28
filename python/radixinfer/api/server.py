@@ -59,6 +59,7 @@ class AppState:
                 self.tokenizer_ingress,
                 self.runtime_ingress,
                 self.frontend_queue,
+                self.config.tokenizer_name or self.config.model,
             )
         if self.runtime_process is None:
             self.runtime_process = start_runtime_process(

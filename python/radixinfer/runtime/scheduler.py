@@ -8,7 +8,7 @@ from radixinfer.cache.page_pool import PagePool
 from radixinfer.cache.prefix_store import PrefixStore
 from radixinfer.config import ServerConfig
 from radixinfer.engine.base import DecodeInput
-from radixinfer.engine.dummy import DummyEngine
+from radixinfer.engine import build_engine
 from radixinfer.runtime.planner import BatchPlanner
 from radixinfer.runtime.types import RequestPhase, RuntimeRequest
 from radixinfer.transport.protocol import AbortRequest, DetokenizeRequest, TokenizedRequest
@@ -29,7 +29,7 @@ class SchedulerRuntime:
             max_batch_size=config.max_batch_size,
             max_prefill_tokens=config.max_prefill_tokens,
         )
-        self.engine = DummyEngine()
+        self.engine = build_engine(config)
 
     def run(self) -> None:
         while True:

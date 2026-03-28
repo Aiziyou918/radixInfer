@@ -16,12 +16,13 @@ class ServerConfig:
     page_size: int = 16
     total_pages: int = 4096
     max_batch_size: int = 32
-    engine_kind: Literal["dummy"] = "dummy"
+    engine_kind: Literal["dummy", "hf"] = "hf"
     prefix_cache_capacity: int = 4096
     queue_poll_interval: float = 0.005
     scheduler_tick_interval: float = 0.001
     max_queue_drain: int = 64
     default_max_tokens: int = 64
     tokenizer_name: str | None = None
+    device: str = "auto"
     start_method: str = "spawn"
     stop_token_ids: tuple[int, ...] = field(default_factory=tuple)
