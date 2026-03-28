@@ -75,3 +75,16 @@ def test_prefix_store_locking_split_node_protects_ancestors_only_once() -> None:
     assert store.size_info.protected_size == 0
     assert store.size_info.evictable_size == 6
     store.check_integrity()
+
+
+def test_prefix_store_can_evict_by_requested_token_budget() -> None:
+    store = PrefixStore(capacity=4, page_size=2)
+    key1, _ = store.insert([1, 2], PageSpan(page_ids=(0,), token_count=2))
+    key2, _ = store.insert([3, 4, 5, 6], PageSpan(page_ids=(1, 2), token_count=4))
+    assert key1 is not None
+    assert key2 is not None
+    evicted = store.evict(2)
+    assert evicted == [PageSpan(page_ids=(0,), token_count=2)]
+    assert store.size_info.evictable_size == 4
+    assert store.size_info.protected_size == 0
+    store.check_integrity()

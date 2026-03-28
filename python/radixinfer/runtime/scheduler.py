@@ -108,7 +108,7 @@ class SchedulerRuntime:
                 continue
             if request.reservation is None:
                 total_reserved = len(request.prompt_tokens) + request.sampling.max_tokens
-                reservation = self.page_pool.reserve_for_tokens(
+                reservation = self._reserve_with_cache_evict(
                     total_reserved,
                     prefix_span=request.prefix_span,
                 )
@@ -259,6 +259,30 @@ class SchedulerRuntime:
                 request.age = 0
             elif not request.finished:
                 request.age += 1
+
+    def _reserve_with_cache_evict(
+        self,
+        token_count: int,
+        *,
+        prefix_span,
+    ):
+        reservation = self.page_pool.reserve_for_tokens(token_count, prefix_span=prefix_span)
+        if reservation is not None:
+            return reservation
+        needed_private_pages = self.page_pool.required_private_pages(
+            token_count,
+            prefix_span=prefix_span,
+        )
+        missing_pages = max(0, needed_private_pages - self.page_pool.free_pages)
+        if missing_pages == 0:
+            return None
+        missing_tokens = missing_pages * self.config.page_size
+        if self.prefix_store.size_info.evictable_size < missing_tokens:
+            return None
+        evicted_spans = self.prefix_store.evict(missing_tokens)
+        for span in evicted_spans:
+            self.page_pool.evict_shared(span)
+        return self.page_pool.reserve_for_tokens(token_count, prefix_span=prefix_span)
 
 
 def start_runtime_process(config: ServerConfig, ingress: mp.Queue, tokenizer_queue: mp.Queue) -> mp.Process:

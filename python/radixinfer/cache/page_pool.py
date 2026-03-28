@@ -67,6 +67,16 @@ class PagePool:
     def free_pages(self) -> int:
         return len(self._free_pages)
 
+    def required_private_pages(
+        self,
+        token_count: int,
+        *,
+        prefix_span: PageSpan | None = None,
+    ) -> int:
+        needed = max(1, (token_count + self.page_size - 1) // self.page_size)
+        shared_pages = len(prefix_span.page_ids) if prefix_span is not None else 0
+        return max(0, needed - shared_pages)
+
     def reserve_for_tokens(
         self,
         token_count: int,

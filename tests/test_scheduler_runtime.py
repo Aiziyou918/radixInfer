@@ -57,9 +57,9 @@ def test_decode_reports_length_finish_reason() -> None:
         request_id=7,
         prompt_tokens=[1, 2],
         sampling=SamplingParams(max_tokens=1),
-        phase=RequestPhase.READY_TO_DECODE,
     )
     runtime.requests[7] = req
+    runtime._run_prefill([7])
     runtime._run_decode([7])
     message = runtime.tokenizer_queue.get(timeout=1.0)
     assert message.finished is True
@@ -85,9 +85,9 @@ def test_decode_respects_request_eos_token() -> None:
         sampling=SamplingParams(max_tokens=4, ignore_eos=False),
         eos_token_id=5,
         stop_token_ids=(),
-        phase=RequestPhase.READY_TO_DECODE,
     )
     runtime.requests[3] = req
+    runtime._run_prefill([3])
     runtime.engine.decode = lambda batch: type("Out", (), {"next_token_ids": [5]})()  # type: ignore[method-assign]
     runtime._run_decode([3])
     message = runtime.tokenizer_queue.get(timeout=1.0)
@@ -112,12 +112,47 @@ def test_decode_can_ignore_eos_when_requested() -> None:
         sampling=SamplingParams(max_tokens=2, ignore_eos=True),
         eos_token_id=5,
         stop_token_ids=(),
-        phase=RequestPhase.READY_TO_DECODE,
     )
     runtime.requests[4] = req
+    runtime._run_prefill([4])
     runtime.engine.decode = lambda batch: type("Out", (), {"next_token_ids": [5]})()  # type: ignore[method-assign]
     runtime._run_decode([4])
     message = runtime.tokenizer_queue.get(timeout=1.0)
     assert message.finished is False
     assert message.finish_reason == "running"
     assert message.emit_text is True
+
+
+def test_prefill_can_evict_unprotected_prefix_cache_to_make_room() -> None:
+    runtime = SchedulerRuntime(
+        ServerConfig(
+            model="debug",
+            engine_kind="dummy",
+            max_prefill_tokens=8,
+            max_batch_size=2,
+            page_size=2,
+            total_pages=2,
+        ),
+        Queue(),
+        Queue(),
+    )
+    req1 = RuntimeRequest(
+        request_id=1,
+        prompt_tokens=[1, 2, 3, 4],
+        sampling=SamplingParams(max_tokens=0),
+    )
+    runtime.requests[1] = req1
+    runtime._run_prefill([1])
+    assert req1.prefix_cache_key is not None
+    runtime.prefix_store.unlock(req1.prefix_cache_key)
+    assert runtime.page_pool.free_pages == 0
+
+    req2 = RuntimeRequest(
+        request_id=2,
+        prompt_tokens=[9, 10],
+        sampling=SamplingParams(max_tokens=0),
+    )
+    runtime.requests[2] = req2
+    runtime._run_prefill([2])
+    assert req2.prefix_span is not None
+    assert runtime.page_pool.read_span(req2.prefix_span) == [9, 10]

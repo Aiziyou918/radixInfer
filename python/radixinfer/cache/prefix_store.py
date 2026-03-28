@@ -150,6 +150,26 @@ class PrefixStore:
             protected_size=self._protected_size,
         )
 
+    def evict(self, size: int) -> list[PageSpan]:
+        if size <= 0:
+            return []
+        if size > self._evictable_size:
+            raise ValueError(
+                f"cannot evict {size} tokens, only {self._evictable_size} tokens are evictable"
+            )
+        evicted: list[PageSpan] = []
+        evicted_size = 0
+        while evicted_size < size:
+            candidate = self._find_evictable_leaf()
+            if candidate is None:
+                raise RuntimeError(
+                    f"failed to evict enough tokens: need {size}, evicted {evicted_size}"
+                )
+            evicted.append(candidate.full_span)
+            evicted_size += candidate.length
+            self._remove_leaf(candidate)
+        return evicted
+
     def _get_node(self, key: PrefixCacheKey | None) -> RadixNode | None:
         if key is None:
             return None
