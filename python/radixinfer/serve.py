@@ -2,11 +2,35 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import socket
 
 import uvicorn
 
 from .api.server import AppState, create_app
 from .config import ServerConfig
+
+
+def _is_tcp_port_available(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def _pick_runtime_dist_port(server_port: int, requested_port: int | None) -> int:
+    if requested_port is not None and _is_tcp_port_available(requested_port):
+        return requested_port
+
+    preferred_port = server_port + 1
+    if _is_tcp_port_available(preferred_port):
+        return preferred_port
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def parse_args() -> tuple[ServerConfig, bool]:
@@ -23,12 +47,21 @@ def parse_args() -> tuple[ServerConfig, bool]:
     parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--engine", dest="engine_kind", choices=["dummy", "hf", "real"], default="hf")
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--tp-size", dest="tp_size", type=int, default=1)
+    parser.add_argument(
+        "--dist-port",
+        dest="dist_port",
+        type=int,
+        default=None,
+        help="Master port for torch.distributed rendezvous; defaults to server port + 1 or another free local port.",
+    )
     parser.add_argument("--disable-zmq", dest="use_zmq", action="store_false")
     parser.add_argument("--shell", action="store_true", help="Run interactive shell instead of HTTP server")
     parser.set_defaults(use_zmq=True)
     args = parser.parse_args()
     run_shell: bool = args.shell
     del args.shell
+    args.dist_port = _pick_runtime_dist_port(args.port, args.dist_port)
     return ServerConfig(**vars(args)), run_shell
 
 
@@ -37,13 +70,13 @@ async def _run_shell(config: ServerConfig) -> None:
     from radixinfer.transport.protocol import SamplingParams, StreamChunk
 
     state = AppState(config=config)
-    state.start()
-    await state.start_listener()
-
-    print("radixInfer shell. /exit to quit, /reset to clear history.")
-    history: list[tuple[str, str]] = []
-
     try:
+        state.start()
+        await state.start_listener()
+
+        print("radixInfer shell. /exit to quit, /reset to clear history.")
+        history: list[tuple[str, str]] = []
+
         while True:
             try:
                 user_input = await asyncio.to_thread(input, "> ")
@@ -97,6 +130,9 @@ async def _run_shell(config: ServerConfig) -> None:
                 history.append((user_input, cur_text))
             finally:
                 state.listeners.pop(request_id, None)
+
+    except KeyboardInterrupt:
+        print()
     finally:
         await state.shutdown()
 
@@ -105,14 +141,16 @@ def main() -> None:
     import os
 
     config, run_shell = parse_args()
-    if run_shell:
-        asyncio.run(_run_shell(config))
-    else:
-        app = create_app(config)
-        uvicorn.run(app, host=config.host, port=config.port, log_level="info")
-    # Force-exit to terminate daemon subprocesses and ZMQ I/O threads immediately.
-    # Without this, Python's atexit/thread-join machinery can hang indefinitely.
-    os._exit(0)
+    try:
+        if run_shell:
+            asyncio.run(_run_shell(config))
+        else:
+            app = create_app(config)
+            uvicorn.run(app, host=config.host, port=config.port, log_level="info")
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        os._exit(0)
 
 
 if __name__ == "__main__":
