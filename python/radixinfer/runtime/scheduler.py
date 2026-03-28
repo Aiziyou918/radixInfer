@@ -95,12 +95,19 @@ class SchedulerRuntime:
             if request.finished or request.prefill_complete:
                 continue
             if request.reservation is None:
-                total_reserved = request.uncached_prompt_tokens + request.sampling.max_tokens
+                total_reserved = len(request.prompt_tokens) + request.sampling.max_tokens
                 reservation = self.page_pool.reserve_for_tokens(total_reserved)
                 if reservation is None:
                     continue
                 request.reservation = reservation
                 request.reserved_tokens = total_reserved
+                if request.prefix_span is not None:
+                    cached_prefix = self.page_pool.read_span(request.prefix_span)
+                    request.cache_span = self.page_pool.write_tokens(
+                        reservation,
+                        cached_prefix,
+                        start_offset=0,
+                    )
 
             chunk_tokens = min(request.remaining_prefill_tokens, remaining_budget)
             if chunk_tokens <= 0:
@@ -113,13 +120,14 @@ class SchedulerRuntime:
             if request.prefill_complete:
                 request.phase = RequestPhase.READY_TO_DECODE
                 prefix_tokens = request.prompt_tokens[: request.prefix_matched + request.prefill_cursor]
-                prefix_span = self.page_pool.write_tokens(
+                cache_span = self.page_pool.write_tokens(
                     request.reservation,
                     prefix_tokens[request.prefix_matched :],
                     start_offset=request.prefix_matched,
                 )
-                request.prefix_span = prefix_span
-                self.prefix_store.insert(prefix_tokens, prefix_span)
+                request.cache_span = cache_span
+                request.prefix_span = cache_span
+                self.prefix_store.insert(prefix_tokens, cache_span)
             if remaining_budget <= 0:
                 break
 
@@ -134,14 +142,23 @@ class SchedulerRuntime:
         for request in selected:
             if request.phase == RequestPhase.READY_TO_DECODE:
                 request.phase = RequestPhase.DECODING
+            if request.cache_span is None:
+                raise RuntimeError("decode request is missing active cache state")
         output = self.engine.decode(
             DecodeInput(
                 request_ids=[req.request_id for req in selected],
-                token_ids=[req.all_tokens for req in selected],
+                token_ids=[self.page_pool.read_span(req.cache_span) for req in selected],  # type: ignore[arg-type]
             )
         )
         for request, token_id in zip(selected, output.next_token_ids, strict=True):
             request.generated_tokens.append(token_id)
+            if request.reservation is None or request.cache_span is None:
+                raise RuntimeError("decode request is missing active cache state")
+            request.cache_span = self.page_pool.write_tokens(
+                request.reservation,
+                [token_id],
+                start_offset=request.cached_token_count,
+            )
             finished = False
             finish_reason = "running"
             request_stop_tokens = set(self.config.stop_token_ids).union(request.stop_token_ids)

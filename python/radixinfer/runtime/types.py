@@ -27,6 +27,7 @@ class RuntimeRequest:
     generated_tokens: list[int] = field(default_factory=list)
     prefix_matched: int = 0
     prefix_span: PageSpan | None = None
+    cache_span: PageSpan | None = None
     prefill_cursor: int = 0
     age: int = 0
     reserved_tokens: int = 0
@@ -51,6 +52,10 @@ class RuntimeRequest:
     @property
     def remaining_tokens(self) -> int:
         return max(0, self.sampling.max_tokens - len(self.generated_tokens))
+
+    @property
+    def cached_token_count(self) -> int:
+        return 0 if self.cache_span is None else self.cache_span.token_count
 
     @property
     def finished(self) -> bool:
