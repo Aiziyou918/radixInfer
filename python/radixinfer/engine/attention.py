@@ -51,11 +51,61 @@ class AttentionBackend:
 
 
 @dataclass
-class HuggingFaceAttentionBackend(AttentionBackend):
+class PagedAttentionBackend(AttentionBackend):
+    page_size: int
+
+    def prepare_batch(
+        self,
+        token_ids: list[list[int]],
+        kv_caches: list[KVCacheView | None] | None = None,
+        metadata: MaterializedBatchMetadata | None = None,
+    ) -> list[AttentionInputs]:
+        prepared: list[AttentionInputs] = []
+        for index, request_tokens in enumerate(token_ids):
+            request_metadata = metadata.request_view(index) if metadata is not None else None
+            prepared.append(
+                AttentionInputs(
+                    input_ids=torch.tensor([request_tokens], dtype=torch.long),
+                    past_key_values=None,
+                    metadata=request_metadata,
+                    paged_plan=self._build_paged_plan(request_metadata),
+                )
+            )
+        return prepared
+
+    def extract_cache_writes(
+        self,
+        model_outputs: list[Any],
+        input_lengths: list[int],
+    ) -> list[AttentionCacheWrite]:
+        raise NotImplementedError
+
+    def _build_paged_plan(
+        self,
+        metadata: MaterializedBatchMetadata | None,
+    ) -> PagedAttentionPlan | None:
+        if metadata is None or not metadata.request_table_states:
+            return None
+        state = metadata.request_table_states[0]
+        return self._plan_from_state(state)
+
+    def _plan_from_state(self, state: RequestTableState) -> PagedAttentionPlan:
+        page_count = (state.token_count + self.page_size - 1) // self.page_size
+        return PagedAttentionPlan(
+            table_slot=state.table_slot,
+            page_ids=tuple(state.page_ids[:page_count]),
+            token_ids=tuple(token_id for token_id in state.token_ids[: state.token_count] if token_id is not None),
+            token_count=state.token_count,
+            write_position=state.write_position,
+            page_size=self.page_size,
+        )
+
+
+@dataclass
+class HuggingFaceFallbackAttentionBackend(PagedAttentionBackend):
     num_layers: int
     num_heads: int
     head_dim: int
-    page_size: int
     device: str
     dtype: torch.dtype
 
@@ -65,32 +115,31 @@ class HuggingFaceAttentionBackend(AttentionBackend):
         kv_caches: list[KVCacheView | None] | None = None,
         metadata: MaterializedBatchMetadata | None = None,
     ) -> list[AttentionInputs]:
-        prepared: list[AttentionInputs] = []
+        prepared = super().prepare_batch(token_ids, kv_caches, metadata)
         kv_caches = kv_caches or [None] * len(token_ids)
-        for index, (request_tokens, kv_cache) in enumerate(zip(token_ids, kv_caches, strict=True)):
-            input_ids = torch.tensor([request_tokens], dtype=torch.long, device=self.device)
-            request_metadata = metadata.request_view(index) if metadata is not None else None
-            paged_plan = self._build_paged_plan(request_metadata)
+        converted: list[AttentionInputs] = []
+        for inputs, kv_cache in zip(prepared, kv_caches, strict=True):
+            input_ids = inputs.input_ids.to(device=self.device)
             if kv_cache is None or kv_cache.token_count == 0:
-                prepared.append(
+                converted.append(
                     AttentionInputs(
                         input_ids=input_ids,
                         past_key_values=None,
-                        metadata=request_metadata,
-                        paged_plan=paged_plan,
+                        metadata=inputs.metadata,
+                        paged_plan=inputs.paged_plan,
                     )
                 )
                 continue
-            legacy_cache = self._to_past_key_values(kv_cache, paged_plan)
-            prepared.append(
+            legacy_cache = self._to_past_key_values(kv_cache, inputs.paged_plan)
+            converted.append(
                 AttentionInputs(
                     input_ids=input_ids,
                     past_key_values=DynamicCache.from_legacy_cache(legacy_cache),
-                    metadata=request_metadata,
-                    paged_plan=paged_plan,
+                    metadata=inputs.metadata,
+                    paged_plan=inputs.paged_plan,
                 )
             )
-        return prepared
+        return converted
 
     def extract_cache_writes(
         self,
@@ -146,23 +195,3 @@ class HuggingFaceAttentionBackend(AttentionBackend):
                 value[:, :heads, :, :dim] = src_value.to(device=self.device, dtype=self.dtype).unsqueeze(0)
             past.append((key, value))
         return tuple(past)
-
-    def _build_paged_plan(
-        self,
-        metadata: MaterializedBatchMetadata | None,
-    ) -> PagedAttentionPlan | None:
-        if metadata is None or not metadata.request_table_states:
-            return None
-        state = metadata.request_table_states[0]
-        return self._plan_from_state(state)
-
-    def _plan_from_state(self, state: RequestTableState) -> PagedAttentionPlan:
-        page_count = (state.token_count + self.page_size - 1) // self.page_size
-        return PagedAttentionPlan(
-            table_slot=state.table_slot,
-            page_ids=tuple(state.page_ids[:page_count]),
-            token_ids=tuple(token_id for token_id in state.token_ids[: state.token_count] if token_id is not None),
-            token_count=state.token_count,
-            write_position=state.write_position,
-            page_size=self.page_size,
-        )

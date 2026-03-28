@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 from transformers import AutoModelForCausalLM, GPT2Config, GPT2LMHeadModel
 
-from .attention import HuggingFaceAttentionBackend
+from .attention import HuggingFaceFallbackAttentionBackend
 from .base import DecodeInput, DecodeOutput, PrefillInput, PrefillOutput
 
 
@@ -37,7 +37,7 @@ class HuggingFaceEngine:
             self.model.config, "hidden_size", num_heads * self.kv_cache_dim
         )
         head_dim = hidden_size // max(1, num_heads)
-        self.attention = HuggingFaceAttentionBackend(
+        self.attention = HuggingFaceFallbackAttentionBackend(
             num_layers=num_layers,
             num_heads=num_heads,
             head_dim=head_dim,
