@@ -186,11 +186,12 @@ def test_executor_prepares_decode_metadata() -> None:
     runtime._run_prefill([8])
     prepared = runtime.executor.prepare_decode_batch([req])
     assert prepared.decode_input.token_ids == [[24]]
-    assert prepared.metadata.positions == [3]
-    assert prepared.metadata.input_table_slots == [req.table_slot]
-    assert prepared.metadata.input_positions == [3]
-    assert prepared.metadata.write_table_slots == [req.table_slot]
-    assert prepared.metadata.write_positions == [4]
+    assert prepared.metadata.positions == (3,)
+    assert prepared.metadata.input_table_slots == (req.table_slot,)
+    assert prepared.metadata.input_positions == (3,)
+    assert prepared.metadata.write_table_slots == (req.table_slot,)
+    assert prepared.metadata.write_positions == (4,)
+    assert prepared.metadata.request_token_counts == (1,)
 
 
 def test_executor_prepares_prefill_metadata() -> None:
@@ -219,11 +220,62 @@ def test_executor_prepares_prefill_metadata() -> None:
     req.cache_span = runtime.page_pool.write_tokens(req.reservation, [31, 32, 33, 34])
     prepared = runtime.executor.prepare_prefill_batch([req])
     assert prepared.prefill_input.token_ids == [[33, 34]]
-    assert prepared.metadata.positions == [2, 3]
-    assert prepared.metadata.input_table_slots == [req.table_slot]
-    assert prepared.metadata.input_positions == [2, 3]
-    assert prepared.metadata.write_table_slots == [req.table_slot]
-    assert prepared.metadata.write_positions == [2, 3]
+    assert prepared.metadata.positions == (2, 3)
+    assert prepared.metadata.input_table_slots == (req.table_slot, req.table_slot)
+    assert prepared.metadata.input_positions == (2, 3)
+    assert prepared.metadata.write_table_slots == (req.table_slot,)
+    assert prepared.metadata.write_positions == (4,)
+    assert prepared.metadata.request_token_counts == (2,)
+
+
+def test_executor_flattens_multi_request_prefill_metadata() -> None:
+    runtime = SchedulerRuntime(
+        ServerConfig(
+            model="debug",
+            engine_kind="dummy",
+            max_prefill_tokens=8,
+            max_batch_size=2,
+            page_size=2,
+            total_pages=16,
+        ),
+        Queue(),
+        Queue(),
+    )
+    req1 = RuntimeRequest(
+        request_id=10,
+        prompt_tokens=[41, 42, 43, 44],
+        sampling=SamplingParams(max_tokens=2),
+        prefix_matched=0,
+        prefill_cursor=2,
+    )
+    req2 = RuntimeRequest(
+        request_id=11,
+        prompt_tokens=[51, 52, 53, 54],
+        sampling=SamplingParams(max_tokens=2),
+        prefix_matched=2,
+        prefill_cursor=2,
+    )
+    req1.table_slot = runtime.table_manager.allocate()
+    req2.table_slot = runtime.table_manager.allocate()
+    req1.reservation = runtime.cache_manager.reserve(6, None)
+    req2.reservation = runtime.cache_manager.reserve(6, None)
+    assert req1.reservation is not None
+    assert req2.reservation is not None
+    req1.cache_span = runtime.page_pool.write_tokens(req1.reservation, [41, 42])
+    req2.cache_span = runtime.page_pool.write_tokens(req2.reservation, [51, 52, 53, 54])
+    prepared = runtime.executor.prepare_prefill_batch([req1, req2])
+    assert prepared.prefill_input.token_ids == [[41, 42], [53, 54]]
+    assert prepared.metadata.positions == (0, 1, 2, 3)
+    assert prepared.metadata.input_table_slots == (
+        req1.table_slot,
+        req1.table_slot,
+        req2.table_slot,
+        req2.table_slot,
+    )
+    assert prepared.metadata.input_positions == (0, 1, 2, 3)
+    assert prepared.metadata.write_table_slots == (req1.table_slot, req2.table_slot)
+    assert prepared.metadata.write_positions == (2, 4)
+    assert prepared.metadata.request_token_counts == (2, 2)
 
 
 def test_prefill_writes_real_kv_into_page_pool_for_hf_debug_engine() -> None:

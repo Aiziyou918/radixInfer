@@ -53,11 +53,12 @@ class Executor:
             for req in requests
         ]
         metadata = MaterializedBatchMetadata(
-            positions=self._make_prefill_positions(requests),
-            input_table_slots=self._make_table_slots(requests),
-            input_positions=self._make_prefill_input_positions(requests),
-            write_table_slots=self._make_table_slots(requests),
-            write_positions=self._make_prefill_write_positions(requests),
+            positions=tuple(self._make_prefill_positions(requests)),
+            input_table_slots=tuple(self._make_prefill_input_table_slots(requests)),
+            input_positions=tuple(self._make_prefill_input_positions(requests)),
+            write_table_slots=tuple(self._make_request_table_slots(requests)),
+            write_positions=tuple(self._make_prefill_write_positions(requests)),
+            request_token_counts=tuple(self._make_prefill_token_counts(requests)),
         )
         return PreparedPrefillBatch(
             prefill_input=PrefillInput(
@@ -71,11 +72,12 @@ class Executor:
 
     def prepare_decode_batch(self, requests: list[RuntimeRequest]) -> PreparedDecodeBatch:
         metadata = MaterializedBatchMetadata(
-            positions=self._make_decode_positions(requests),
-            input_table_slots=self._make_table_slots(requests),
-            input_positions=self._make_decode_input_positions(requests),
-            write_table_slots=self._make_table_slots(requests),
-            write_positions=self._make_decode_write_positions(requests),
+            positions=tuple(self._make_decode_positions(requests)),
+            input_table_slots=tuple(self._make_decode_input_table_slots(requests)),
+            input_positions=tuple(self._make_decode_input_positions(requests)),
+            write_table_slots=tuple(self._make_request_table_slots(requests)),
+            write_positions=tuple(self._make_decode_write_positions(requests)),
+            request_token_counts=tuple(1 for _ in requests),
         )
         return PreparedDecodeBatch(
             decode_input=DecodeInput(
@@ -90,7 +92,7 @@ class Executor:
             metadata=metadata,
         )
 
-    def _make_table_slots(self, requests: list[RuntimeRequest]) -> list[int]:
+    def _make_request_table_slots(self, requests: list[RuntimeRequest]) -> list[int]:
         return [req.table_slot for req in requests if req.table_slot is not None]
 
     def _make_prefill_positions(self, requests: list[RuntimeRequest]) -> list[int]:
@@ -102,14 +104,25 @@ class Executor:
     def _make_prefill_input_positions(self, requests: list[RuntimeRequest]) -> list[int]:
         return self._make_prefill_positions(requests)
 
-    def _make_prefill_write_positions(self, requests: list[RuntimeRequest]) -> list[int]:
-        positions: list[int] = []
+    def _make_prefill_input_table_slots(self, requests: list[RuntimeRequest]) -> list[int]:
+        table_slots: list[int] = []
         for req in requests:
-            positions.extend(range(req.prefix_matched, req.prefix_matched + req.prefill_cursor))
-        return positions
+            if req.table_slot is None:
+                continue
+            table_slots.extend([req.table_slot] * req.prefill_cursor)
+        return table_slots
+
+    def _make_prefill_write_positions(self, requests: list[RuntimeRequest]) -> list[int]:
+        return [req.prefix_matched + req.prefill_cursor for req in requests]
+
+    def _make_prefill_token_counts(self, requests: list[RuntimeRequest]) -> list[int]:
+        return [req.prefill_cursor for req in requests]
 
     def _make_decode_positions(self, requests: list[RuntimeRequest]) -> list[int]:
         return [req.cached_token_count - 1 for req in requests]
+
+    def _make_decode_input_table_slots(self, requests: list[RuntimeRequest]) -> list[int]:
+        return self._make_request_table_slots(requests)
 
     def _make_decode_input_positions(self, requests: list[RuntimeRequest]) -> list[int]:
         return [req.cached_token_count - 1 for req in requests]

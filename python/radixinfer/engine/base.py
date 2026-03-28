@@ -8,11 +8,12 @@ from radixinfer.cache.page_pool import KVCacheView
 
 @dataclass(frozen=True)
 class MaterializedBatchMetadata:
-    positions: list[int] = field(default_factory=list)
-    input_table_slots: list[int] = field(default_factory=list)
-    input_positions: list[int] = field(default_factory=list)
-    write_table_slots: list[int] = field(default_factory=list)
-    write_positions: list[int] = field(default_factory=list)
+    positions: tuple[int, ...] = field(default_factory=tuple)
+    input_table_slots: tuple[int, ...] = field(default_factory=tuple)
+    input_positions: tuple[int, ...] = field(default_factory=tuple)
+    write_table_slots: tuple[int, ...] = field(default_factory=tuple)
+    write_positions: tuple[int, ...] = field(default_factory=tuple)
+    request_token_counts: tuple[int, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
