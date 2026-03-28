@@ -7,4 +7,6 @@ __pycache__/
 .ruff_cache/
 .venv/
 AGENTS.md
+CLAUDE.md
 MIGRATION_STATUS.md
+.claude

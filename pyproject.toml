@@ -30,3 +30,7 @@ where = ["python"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--ignore=tests/test_multiprocess_server.py --ignore=tests/test_api_server.py"
+markers = [
+  "integration: slow tests that start real server processes (deselect with -m 'not integration')",
+]

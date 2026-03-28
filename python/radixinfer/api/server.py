@@ -104,6 +104,9 @@ class AppState:
     inline_runtime: SchedulerRuntime | None = None
     inline_tokenizer: Any | None = None
     inline_tasks: set[asyncio.Task] = field(default_factory=set)
+    # Shared completion set: whichever pump call consumes the finished chunk writes
+    # request_id here so _run_inline_request() can always see it.
+    _inline_completed: set[int] = field(default_factory=set)
 
     @property
     def inline_mode(self) -> bool:
@@ -175,9 +178,9 @@ class AppState:
 
     async def abort_request(self, request_id: int) -> None:
         self.runtime_ingress.put(AbortRequest(request_id=request_id))
-        if not self.inline_mode:
-            return
-        await self._pump_inline_runtime()
+        # In inline mode _run_inline_request processes the AbortRequest on its
+        # next _pump_inline_runtime call and exits cleanly.  Do NOT pump here or
+        # the finished marker gets consumed before _run_inline_request sees it.
 
     async def _run_inline_request(
         self,
@@ -196,16 +199,22 @@ class AppState:
                 stop_token_ids=getattr(self.inline_tokenizer, "stop_token_ids", ()),
             )
         )
-        while True:
-            done = await self._pump_inline_runtime()
-            if done.get(request_id, False):
-                return
-            await asyncio.sleep(self.config.scheduler_tick_interval)
+        try:
+            while True:
+                # Check _inline_completed BEFORE pumping so we catch completions
+                # that were written by a concurrent abort_request() pump call.
+                if request_id in self._inline_completed:
+                    return
+                await self._pump_inline_runtime()
+                if request_id in self._inline_completed:
+                    return
+                await asyncio.sleep(self.config.scheduler_tick_interval)
+        finally:
+            self._inline_completed.discard(request_id)
 
-    async def _pump_inline_runtime(self) -> dict[int, bool]:
+    async def _pump_inline_runtime(self) -> None:
         assert self.inline_runtime is not None
         assert self.inline_tokenizer is not None
-        completed: dict[int, bool] = {}
         self.inline_runtime._drain_ingress()
         self.inline_runtime._tick()
         while True:
@@ -228,8 +237,9 @@ class AppState:
             if listener is not None:
                 await listener.put(chunk)
             if chunk.finished:
-                completed[chunk.request_id] = True
-        return completed
+                # Write to the shared set so _run_inline_request() always sees
+                # the completion even when abort_request() consumed this chunk.
+                self._inline_completed.add(chunk.request_id)
 
     async def collect_response(
         self,
