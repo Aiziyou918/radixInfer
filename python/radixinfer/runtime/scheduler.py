@@ -7,9 +7,12 @@ from queue import Empty
 from radixinfer.cache.page_pool import PagePool
 from radixinfer.cache.prefix_store import PrefixStore
 from radixinfer.config import ServerConfig
-from radixinfer.engine.base import DecodeInput, PrefillInput
+from radixinfer.engine.base import PrefillInput
 from radixinfer.engine import build_engine
+from radixinfer.runtime.cache_manager import CacheManager
+from radixinfer.runtime.executor import Executor
 from radixinfer.runtime.planner import BatchPlanner
+from radixinfer.runtime.table import TableManager
 from radixinfer.runtime.types import RequestPhase, RuntimeRequest
 from radixinfer.transport.protocol import AbortRequest, DetokenizeRequest, TokenizedRequest
 
@@ -30,6 +33,20 @@ class SchedulerRuntime:
         self.prefix_store = PrefixStore(
             capacity=config.prefix_cache_capacity,
             page_size=config.page_size,
+        )
+        self.cache_manager = CacheManager(
+            page_pool=self.page_pool,
+            prefix_store=self.prefix_store,
+            page_size=config.page_size,
+        )
+        self.table_manager = TableManager(
+            max_running_requests=config.max_running_requests,
+            page_size=config.page_size,
+            max_tokens_per_request=config.max_prefill_tokens + config.default_max_tokens,
+        )
+        self.executor = Executor(
+            page_pool=self.page_pool,
+            table_manager=self.table_manager,
         )
         self.planner = BatchPlanner(
             max_batch_size=config.max_batch_size,
@@ -66,16 +83,18 @@ class SchedulerRuntime:
                 request.prefix_matched = prefix_hit.matched_tokens
                 request.prefix_span = prefix_hit.cached_span
                 request.prefix_cache_key = prefix_hit.cache_key
-                self.prefix_store.lock(request.prefix_cache_key)
+                self.cache_manager.lock_prefix(request.prefix_cache_key)
                 self.requests[item.request_id] = request
             elif isinstance(item, AbortRequest):
                 request = self.requests.get(item.request_id)
                 if request is not None and not request.finished:
                     request.phase = RequestPhase.ABORTED
-                    self.prefix_store.unlock(request.prefix_cache_key)
-                    if request.reservation is not None:
-                        self.page_pool.release(request.reservation)
-                        request.reservation = None
+                    self.cache_manager.unlock_prefix(request.prefix_cache_key)
+                    self.cache_manager.release(request.reservation)
+                    request.reservation = None
+                    if request.table_slot is not None:
+                        self.table_manager.free(request.table_slot)
+                        request.table_slot = None
                     self.tokenizer_queue.put(
                         DetokenizeRequest(
                             request_id=item.request_id,
@@ -107,21 +126,29 @@ class SchedulerRuntime:
             if request.finished:
                 continue
             if request.reservation is None:
+                if request.table_slot is None:
+                    request.table_slot = self.table_manager.allocate()
+                if request.table_slot is None:
+                    continue
                 total_reserved = len(request.prompt_tokens) + request.sampling.max_tokens
-                reservation = self._reserve_with_cache_evict(
+                reservation = self.cache_manager.reserve(
                     total_reserved,
-                    prefix_span=request.prefix_span,
+                    request.prefix_span,
                 )
                 if reservation is None:
+                    self.table_manager.free(request.table_slot)
+                    request.table_slot = None
                     continue
                 request.reservation = reservation
                 request.reserved_tokens = total_reserved
                 if request.prefix_span is not None:
                     request.cache_span = request.prefix_span
+                    self.executor.materialize_request(request)
             if request.prefill_complete:
                 request.phase = RequestPhase.READY_TO_DECODE
                 if request.prefix_span is not None:
                     request.cache_span = request.prefix_span
+                    self.executor.materialize_request(request)
                 continue
 
             chunk_tokens = min(request.remaining_prefill_tokens, remaining_budget)
@@ -162,14 +189,12 @@ class SchedulerRuntime:
                     )
                 request.cache_span = cache_span
                 request.prefix_span = cache_span
-                self.page_pool.share_span(cache_span)
-                new_key, evicted_spans = self.prefix_store.insert(prefix_tokens, cache_span)
-                for evicted_span in evicted_spans:
-                    self.page_pool.evict_shared(evicted_span)
+                self.executor.materialize_request(request)
+                new_key = self.cache_manager.commit_prefix(prefix_tokens, cache_span)
                 if new_key is not None and new_key != request.prefix_cache_key:
-                    self.prefix_store.unlock(request.prefix_cache_key)
+                    self.cache_manager.unlock_prefix(request.prefix_cache_key)
                     request.prefix_cache_key = new_key
-                    self.prefix_store.lock(request.prefix_cache_key)
+                    self.cache_manager.lock_prefix(request.prefix_cache_key)
             if remaining_budget <= 0:
                 break
 
@@ -186,16 +211,7 @@ class SchedulerRuntime:
                 request.phase = RequestPhase.DECODING
             if request.cache_span is None:
                 raise RuntimeError("decode request is missing active cache state")
-        output = self.engine.decode(
-            DecodeInput(
-                request_ids=[req.request_id for req in selected],
-                token_ids=[self.page_pool.read_span(req.cache_span)[-1:] for req in selected],  # type: ignore[arg-type]
-                kv_caches=[
-                    self.page_pool.read_kv(req.cache_span, token_count=max(0, req.cached_token_count - 1))
-                    for req in selected
-                ],  # type: ignore[arg-type]
-            )
-        )
+        output = self.engine.decode(self.executor.prepare_decode_input(selected))
         kv_writes = getattr(output, "kv_writes", [None] * len(selected))
         for request, token_id, kv_write in zip(
             selected, output.next_token_ids, kv_writes, strict=True
@@ -215,6 +231,7 @@ class SchedulerRuntime:
                 [token_id],
                 start_offset=request.cached_token_count,
             )
+            self.executor.append_token(request, token_id)
             finished = False
             finish_reason = "running"
             emit_text = True
@@ -236,10 +253,12 @@ class SchedulerRuntime:
                 finish_reason = "length"
             if finished:
                 request.phase = RequestPhase.FINISHED
-                self.prefix_store.unlock(request.prefix_cache_key)
-                if request.reservation is not None:
-                    self.page_pool.release(request.reservation)
-                    request.reservation = None
+                self.cache_manager.unlock_prefix(request.prefix_cache_key)
+                self.cache_manager.release(request.reservation)
+                request.reservation = None
+                if request.table_slot is not None:
+                    self.table_manager.free(request.table_slot)
+                    request.table_slot = None
             self.tokenizer_queue.put(
                 DetokenizeRequest(
                     request_id=request.request_id,
@@ -259,30 +278,6 @@ class SchedulerRuntime:
                 request.age = 0
             elif not request.finished:
                 request.age += 1
-
-    def _reserve_with_cache_evict(
-        self,
-        token_count: int,
-        *,
-        prefix_span,
-    ):
-        reservation = self.page_pool.reserve_for_tokens(token_count, prefix_span=prefix_span)
-        if reservation is not None:
-            return reservation
-        needed_private_pages = self.page_pool.required_private_pages(
-            token_count,
-            prefix_span=prefix_span,
-        )
-        missing_pages = max(0, needed_private_pages - self.page_pool.free_pages)
-        if missing_pages == 0:
-            return None
-        missing_tokens = missing_pages * self.config.page_size
-        if self.prefix_store.size_info.evictable_size < missing_tokens:
-            return None
-        evicted_spans = self.prefix_store.evict(missing_tokens)
-        for span in evicted_spans:
-            self.page_pool.evict_shared(span)
-        return self.page_pool.reserve_for_tokens(token_count, prefix_span=prefix_span)
 
 
 def start_runtime_process(config: ServerConfig, ingress: mp.Queue, tokenizer_queue: mp.Queue) -> mp.Process:

@@ -33,6 +33,7 @@ class RuntimeRequest:
     prefill_cursor: int = 0
     age: int = 0
     reserved_tokens: int = 0
+    table_slot: int | None = None
     reservation: PageReservation | None = None
 
     @property
