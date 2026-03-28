@@ -1,281 +1,258 @@
 from __future__ import annotations
 
-import multiprocessing as mp
-import time
-from queue import Empty
+import queue
+from typing import List, NamedTuple, NoReturn, Optional, Set, Tuple, TypeAlias
 
-from radixinfer.cache.page_pool import PagePool
-from radixinfer.cache.prefix_store import PrefixStore
-from radixinfer.config import ServerConfig
-from radixinfer.engine import build_engine
+import torch
+
+from radixinfer.core import Batch, Req
+from radixinfer.engine.engine import Engine, ForwardOutput
+from radixinfer.engine.sample import BatchSamplingArgs
 from radixinfer.runtime.cache_manager import CacheManager
-from radixinfer.runtime.executor import Executor
-from radixinfer.runtime.planner import BatchPlanner
+from radixinfer.runtime.decode import DecodeManager
+from radixinfer.runtime.prefill import ChunkedReq, PrefillManager
 from radixinfer.runtime.table import TableManager
-from radixinfer.runtime.types import RequestPhase, RuntimeRequest
-from radixinfer.transport.protocol import AbortRequest, DetokenizeRequest, TokenizedRequest
+
+Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
 
-class SchedulerRuntime:
-    def __init__(self, config: ServerConfig, ingress: mp.Queue, tokenizer_queue: mp.Queue) -> None:
-        self.config = config
-        self.ingress = ingress
-        self.tokenizer_queue = tokenizer_queue
-        self.requests: dict[int, RuntimeRequest] = {}
-        self.page_pool = PagePool(
-            total_pages=config.total_pages,
-            page_size=config.page_size,
-            kv_cache_dim=config.kv_cache_dim,
-            kv_num_layers=config.kv_num_layers,
-            kv_num_heads=config.kv_num_heads,
-        )
-        self.prefix_store = PrefixStore(
-            capacity=config.prefix_cache_capacity,
-            page_size=config.page_size,
-        )
+class ForwardInput(NamedTuple):
+    batch: Batch
+    sample_args: BatchSamplingArgs
+    input_tuple: Indice2D
+    write_tuple: Indice2D
+
+
+ForwardData: TypeAlias = "tuple[ForwardInput, ForwardOutput]"
+
+
+class Scheduler:
+    """Overlap-scheduled inference scheduler, aligned with mini-sglang Scheduler.
+
+    Key responsibilities:
+    - Receive tokenized requests via queue
+    - Schedule prefill / decode batches
+    - Overlap GPU execution with batch post-processing (CPU-side)
+    - Send detokenize results back via result queue
+    """
+
+    def __init__(self, config, engine: Engine | None = None):
+        from radixinfer.runtime.scheduler_config import SchedulerConfig
+
+        if engine is None:
+            engine = Engine(config)
+
+        self.engine = engine
+        self.device = engine.device
+        self.stream = torch.cuda.Stream(device=self.device)
+        self.engine_stream_ctx = torch.cuda.stream(engine.stream)
+        torch.cuda.set_stream(self.stream)
+
+        self.table_manager = TableManager(config.max_running_req, engine.page_table)
         self.cache_manager = CacheManager(
-            page_pool=self.page_pool,
-            prefix_store=self.prefix_store,
-            page_size=config.page_size,
+            engine.num_pages,
+            config.page_size,
+            engine.page_table,
+            getattr(config, "cache_type", "radix"),
         )
-        self.table_manager = TableManager(
-            max_running_requests=config.max_running_requests,
-            page_size=config.page_size,
-            max_tokens_per_request=config.max_prefill_tokens + config.default_max_tokens,
+        self.decode_manager = DecodeManager(config.page_size)
+        self.prefill_manager = PrefillManager(
+            self.cache_manager, self.table_manager, self.decode_manager
         )
-        self.executor = Executor(
-            page_pool=self.page_pool,
-            table_manager=self.table_manager,
-        )
-        self.planner = BatchPlanner(
-            max_batch_size=config.max_batch_size,
-            max_prefill_tokens=config.max_prefill_tokens,
-        )
-        self.engine = build_engine(config)
 
-    def run(self) -> None:
+        self.finished_reqs: Set[Req] = set()
+        self.prefill_budget = getattr(config, "max_extend_tokens", 8192)
+        self.token_pool = self.table_manager.token_pool
+
+        # Simple queue-based I/O (fallback, ZMQ upgrade in Phase 10)
+        self._in_queue: queue.Queue = queue.Queue()
+        self._out_queue: queue.Queue = queue.Queue()
+
+        # EOS tracking from tokenizer
+        self.eos_token_id: int = 0
+
+    def enqueue(self, request) -> None:
+        """Put a tokenized request into the input queue."""
+        self._in_queue.put(request)
+
+    def dequeue_results(self) -> list:
+        """Drain all available detokenize results."""
+        results = []
+        while not self._out_queue.empty():
+            results.append(self._out_queue.get_nowait())
+        return results
+
+    def run_when_idle(self) -> None:
+        self.cache_manager.check_integrity()
+
+    @torch.inference_mode()
+    def run_forever(self) -> NoReturn:
+        data = None
         while True:
-            if self._drain_ingress():
-                return
-            self._tick()
-            time.sleep(self.config.scheduler_tick_interval)
+            data = self.overlap_loop(data)
 
-    def _drain_ingress(self) -> bool:
-        stop = False
-        for _ in range(self.config.max_queue_drain):
+    def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
+        blocking = not (
+            last_data is not None
+            or self.prefill_manager.runnable
+            or self.decode_manager.runnable
+        )
+        self._drain_input_queue(blocking=blocking)
+
+        forward_input = self._schedule_next_batch()
+        ongoing_data = None
+        if forward_input is not None:
+            with self.engine_stream_ctx:
+                self.engine.stream.wait_stream(self.stream)
+                ongoing_data = (forward_input, self._forward(forward_input))
+
+        self._process_last_data(last_data)
+        return ongoing_data
+
+    def normal_loop(self) -> None:
+        blocking = not (self.prefill_manager.runnable or self.decode_manager.runnable)
+        self._drain_input_queue(blocking=blocking)
+
+        forward_input = self._schedule_next_batch()
+        if forward_input is not None:
+            ongoing_data = (forward_input, self._forward(forward_input))
+            self._process_last_data(ongoing_data)
+
+    def _drain_input_queue(self, blocking: bool) -> None:
+        if blocking:
+            self.run_when_idle()
             try:
-                item = self.ingress.get_nowait()
-            except Empty:
-                break
-            if item is None:
-                stop = True
-                continue
-            if isinstance(item, TokenizedRequest):
-                request = RuntimeRequest(
-                    request_id=item.request_id,
-                    prompt_tokens=item.token_ids,
-                    sampling=item.sampling,
-                    eos_token_id=item.eos_token_id,
-                    stop_token_ids=item.stop_token_ids,
-                )
-                prefix_hit = self.prefix_store.match(item.token_ids)
-                request.prefix_matched = prefix_hit.matched_tokens
-                request.prefix_span = prefix_hit.cached_span
-                request.prefix_cache_key = prefix_hit.cache_key
-                self.cache_manager.lock_prefix(request.prefix_cache_key)
-                self.requests[item.request_id] = request
-            elif isinstance(item, AbortRequest):
-                request = self.requests.get(item.request_id)
-                if request is not None and not request.finished:
-                    request.phase = RequestPhase.ABORTED
-                    self.cache_manager.unlock_prefix(request.prefix_cache_key)
-                    self.cache_manager.release(request.reservation)
-                    request.reservation = None
-                    if request.table_slot is not None:
-                        self.table_manager.free(request.table_slot)
-                        request.table_slot = None
-                    self.tokenizer_queue.put(
-                        DetokenizeRequest(
-                            request_id=item.request_id,
-                            token_id=0,
-                            finished=True,
-                            finish_reason="abort",
-                            emit_text=False,
-                            prompt_tokens=len(request.prompt_tokens),
-                            completion_tokens=len(request.generated_tokens),
-                        )
-                    )
-        return stop
+                req = self._in_queue.get(timeout=0.5)
+                self._process_new_req(req)
+            except queue.Empty:
+                return
+        while not self._in_queue.empty():
+            req = self._in_queue.get_nowait()
+            self._process_new_req(req)
 
-    def _tick(self) -> None:
-        plan = self.planner.build_plan(list(self.requests.values()))
-        if not plan.prefill and not plan.decode:
-            self._age_waiting()
+    def _process_new_req(self, req) -> None:
+        # req can be a TokenizedRequest or a dict-like message
+        if hasattr(req, "prompt_token_ids"):
+            self.prefill_manager.add_one_req(req)
+        else:
+            # Handle abort or other message types
+            pass
+
+    def _process_last_data(self, last_data: ForwardData | None) -> None:
+        if last_data is None:
             return
-        if plan.prefill:
-            self._run_prefill(plan.prefill)
-        if plan.decode:
-            self._run_decode(plan.decode)
-        self._age_waiting(reset_selected=set(plan.prefill + plan.decode))
 
-    def _run_prefill(self, request_ids: list[int]) -> None:
-        remaining_budget = self.config.max_prefill_tokens
-        for request_id in request_ids:
-            request = self.requests[request_id]
-            if request.finished:
-                continue
-            if request.reservation is None:
-                if request.table_slot is None:
-                    request.table_slot = self.table_manager.allocate()
-                if request.table_slot is None:
+        forward_input, (_, next_tokens_cpu, copy_done) = last_data[0], last_data[1]
+        batch = forward_input.batch
+        copy_done.synchronize()
+
+        new_finished: Set[Req] = set()
+        with self.cache_manager.lazy_free_region():
+            for i, req in enumerate(batch.reqs):
+                if isinstance(req, ChunkedReq):
                     continue
-                total_reserved = len(request.prompt_tokens) + request.sampling.max_tokens
-                reservation = self.cache_manager.reserve(
-                    total_reserved,
-                    request.prefix_span,
-                )
-                if reservation is None:
-                    self.table_manager.free(request.table_slot)
-                    request.table_slot = None
-                    continue
-                request.reservation = reservation
-                request.reserved_tokens = total_reserved
-                if request.prefix_span is not None:
-                    request.cache_span = request.prefix_span
-                    self.executor.materialize_request(request)
-            if request.prefill_complete:
-                request.phase = RequestPhase.READY_TO_DECODE
-                if request.prefix_span is not None:
-                    request.cache_span = request.prefix_span
-                    self.executor.materialize_request(request)
-                continue
+                next_token = next_tokens_cpu[i]
+                req.append_host(next_token.unsqueeze(0))
+                next_token_id = int(next_token.item())
+                finished = not req.can_decode
+                if not req.sampling_params.ignore_eos:
+                    finished |= next_token_id == self.eos_token_id
 
-            chunk_tokens = min(request.remaining_prefill_tokens, remaining_budget)
-            if chunk_tokens <= 0:
-                break
+                self._out_queue.put_nowait({
+                    "uid": req.uid,
+                    "next_token": next_token_id,
+                    "finished": finished,
+                })
 
-            request.phase = RequestPhase.PREFILLING
-            request.prefill_cursor += chunk_tokens
-            remaining_budget -= chunk_tokens
+                if finished and req not in self.finished_reqs:
+                    self.decode_manager.remove_req(req)
+                    self._free_req_resources(req)
+                    new_finished.add(req)
+                elif batch.is_prefill:
+                    self.cache_manager.cache_req(req, finished=False)
 
-            if request.prefill_complete:
-                request.phase = RequestPhase.READY_TO_DECODE
-                prefix_tokens = request.prompt_tokens[: request.prefix_matched + request.prefill_cursor]
-                cache_span = self.page_pool.write_tokens(
-                    request.reservation,
-                    prefix_tokens[request.prefix_matched :],
-                    start_offset=request.prefix_matched,
-                )
-                request.cache_span = cache_span
-                prepared = self.executor.prepare_prefill_batch([request])
-                prefill_output = self.engine.prefill(prepared.prefill_input)
-                if prefill_output.kv_writes:
-                    kv_write = prefill_output.kv_writes[0]
-                    cache_span = self.page_pool.write_kv(
-                        request.reservation,
-                        kv_write.keys,
-                        kv_write.values,
-                        start_offset=request.prefix_matched,
-                    )
-                request.cache_span = cache_span
-                request.prefix_span = cache_span
-                self.executor.materialize_request(request)
-                new_key = self.cache_manager.commit_prefix(prefix_tokens, cache_span)
-                if new_key is not None and new_key != request.prefix_cache_key:
-                    self.cache_manager.unlock_prefix(request.prefix_cache_key)
-                    request.prefix_cache_key = new_key
-                    self.cache_manager.lock_prefix(request.prefix_cache_key)
-            if remaining_budget <= 0:
-                break
+        self.finished_reqs = new_finished
 
-    def _run_decode(self, request_ids: list[int]) -> None:
-        selected = [
-            self.requests[request_id]
-            for request_id in request_ids
-            if self.requests[request_id].phase in {RequestPhase.READY_TO_DECODE, RequestPhase.DECODING}
-        ]
-        if not selected:
-            return
-        for request in selected:
-            if request.phase == RequestPhase.READY_TO_DECODE:
-                request.phase = RequestPhase.DECODING
-            if request.cache_span is None:
-                raise RuntimeError("decode request is missing active cache state")
-        prepared = self.executor.prepare_decode_batch(selected)
-        output = self.engine.decode(prepared.decode_input)
-        kv_writes = getattr(output, "kv_writes", [None] * len(selected))
-        for request, token_id, kv_write in zip(
-            selected, output.next_token_ids, kv_writes, strict=True
-        ):
-            request.generated_tokens.append(token_id)
-            if request.reservation is None or request.cache_span is None:
-                raise RuntimeError("decode request is missing active cache state")
-            if kv_write is not None and kv_write.token_count > 0:
-                request.cache_span = self.page_pool.write_kv(
-                    request.reservation,
-                    kv_write.keys,
-                    kv_write.values,
-                    start_offset=max(0, request.cached_token_count - kv_write.token_count),
-                )
-            request.cache_span = self.page_pool.write_tokens(
-                request.reservation,
-                [token_id],
-                start_offset=request.cached_token_count,
-            )
-            self.executor.append_token(request, token_id)
-            finished = False
-            finish_reason = "running"
-            emit_text = True
-            request_stop_tokens = set(self.config.stop_token_ids).union(request.stop_token_ids)
-            if (
-                not request.sampling.ignore_eos
-                and request.eos_token_id is not None
-                and token_id == request.eos_token_id
-            ):
-                finished = True
-                finish_reason = "stop"
-                emit_text = False
-            elif token_id in request_stop_tokens:
-                finished = True
-                finish_reason = "stop"
-                emit_text = False
-            elif request.remaining_tokens <= 0:
-                finished = True
-                finish_reason = "length"
-            if finished:
-                request.phase = RequestPhase.FINISHED
-                self.cache_manager.unlock_prefix(request.prefix_cache_key)
-                self.cache_manager.release(request.reservation)
-                request.reservation = None
-                if request.table_slot is not None:
-                    self.table_manager.free(request.table_slot)
-                    request.table_slot = None
-            self.tokenizer_queue.put(
-                DetokenizeRequest(
-                    request_id=request.request_id,
-                    token_id=token_id,
-                    finished=finished,
-                    finish_reason=finish_reason,
-                    emit_text=emit_text,
-                    prompt_tokens=len(request.prompt_tokens),
-                    completion_tokens=len(request.generated_tokens),
-                )
-            )
+    def _free_req_resources(self, req: Req) -> None:
+        self.table_manager.free(req.table_idx)
+        self.cache_manager.cache_req(req, finished=True)
 
-    def _age_waiting(self, reset_selected: set[int] | None = None) -> None:
-        reset_selected = reset_selected or set()
-        for request in self.requests.values():
-            if request.request_id in reset_selected:
-                request.age = 0
-            elif not request.finished:
-                request.age += 1
+    def _schedule_next_batch(self) -> ForwardInput | None:
+        batch = (
+            self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            or self.decode_manager.schedule_next_batch()
+        )
+        if batch is None:
+            return None
+        return self._prepare_batch(batch)
+
+    def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        self.engine.graph_runner.pad_batch(batch)
+        self.cache_manager.allocate_paged(batch.reqs)
+        batch.positions = _make_positions(batch, self.device)
+        input_mapping = _make_input_tuple(batch, self.device)
+        write_mapping = _make_write_tuple(batch, self.device)
+        batch.out_loc = self.engine.page_table[input_mapping]
+        self.engine.attn_backend.prepare_metadata(batch)
+        return ForwardInput(
+            batch=batch,
+            sample_args=self.engine.sampler.prepare(batch),
+            input_tuple=input_mapping,
+            write_tuple=write_mapping,
+        )
+
+    def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
+        batch, sample_args, input_mapping, output_mapping = forward_input
+        batch.input_ids = self.token_pool[input_mapping]
+        forward_output = self.engine.forward_batch(batch, sample_args)
+        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        return forward_output
+
+    def shutdown(self) -> None:
+        torch.cuda.synchronize(self.device)
+        self.engine.shutdown()
 
 
-def start_runtime_process(config: ServerConfig, ingress: mp.Queue, tokenizer_queue: mp.Queue) -> mp.Process:
-    process = mp.Process(
-        target=SchedulerRuntime(config, ingress, tokenizer_queue).run,
-        name="radixinfer-runtime",
-        daemon=True,
+# ---------------------------------------------------------------------------
+# Hot-path batch metadata builders (pin_memory + non_blocking H2D)
+# ---------------------------------------------------------------------------
+
+def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+    needed_size = sum(r.extend_len for r in batch.padded_reqs)
+    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
+    offset = 0
+    for req in batch.padded_reqs:
+        length = req.extend_len
+        torch.arange(
+            req.cached_len,
+            req.device_len,
+            dtype=torch.int32,
+            out=indices_host[offset : offset + length],
+        )
+        offset += length
+    return indices_host.to(device, non_blocking=True)
+
+
+def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
+    offset = 0
+    for req in batch.padded_reqs:
+        length = req.extend_len
+        mapping_host[offset : offset + length].fill_(req.table_idx)
+        offset += length
+    return (
+        mapping_host.to(device, non_blocking=True),
+        batch.positions.to(torch.int64),
     )
-    process.start()
-    return process
+
+
+def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    mapping_list = [req.table_idx for req in batch.reqs]
+    write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
+    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
+    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
+    return (
+        mapping_host.to(device, non_blocking=True),
+        write_host.to(device, non_blocking=True),
+    )

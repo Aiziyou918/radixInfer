@@ -1,0 +1,27 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import torch
+
+if TYPE_CHECKING:
+    from radixinfer.core import SamplingParams
+
+    from radixinfer.runtime.prefill import ChunkedReq
+
+
+@dataclass
+class PendingReq:
+    uid: int
+    input_ids: torch.Tensor  # cpu tensor
+    sampling_params: SamplingParams
+    chunked_req: ChunkedReq | None = None
+
+    @property
+    def input_len(self) -> int:
+        return len(self.input_ids)
+
+    @property
+    def output_len(self) -> int:
+        return self.sampling_params.max_tokens
