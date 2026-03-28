@@ -13,6 +13,7 @@ def build_engine(config: ServerConfig):
         kv_num_layers=config.kv_num_layers,
         kv_num_heads=config.kv_num_heads,
         kv_cache_dim=config.kv_cache_dim,
+        page_size=config.page_size,
     )
 
 

@@ -8,7 +8,21 @@ from transformers.cache_utils import DynamicCache
 
 from radixinfer.cache.page_pool import KVCacheView
 
-from .base import AttentionCacheWrite, MaterializedBatchMetadata
+from .base import AttentionCacheWrite, MaterializedBatchMetadata, RequestTableState
+
+
+@dataclass(frozen=True)
+class PagedAttentionPlan:
+    table_slot: int
+    page_ids: tuple[int | None, ...]
+    token_ids: tuple[int | None, ...]
+    token_count: int
+    write_position: int
+    page_size: int
+
+    @property
+    def page_count(self) -> int:
+        return len(self.page_ids)
 
 
 @dataclass(frozen=True)
@@ -16,6 +30,7 @@ class AttentionInputs:
     input_ids: torch.Tensor
     past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None
     metadata: MaterializedBatchMetadata | None = None
+    paged_plan: PagedAttentionPlan | None = None
 
 
 class AttentionBackend:
@@ -40,6 +55,7 @@ class HuggingFaceAttentionBackend(AttentionBackend):
     num_layers: int
     num_heads: int
     head_dim: int
+    page_size: int
     device: str
     dtype: torch.dtype
 
@@ -54,17 +70,24 @@ class HuggingFaceAttentionBackend(AttentionBackend):
         for index, (request_tokens, kv_cache) in enumerate(zip(token_ids, kv_caches, strict=True)):
             input_ids = torch.tensor([request_tokens], dtype=torch.long, device=self.device)
             request_metadata = metadata.request_view(index) if metadata is not None else None
+            paged_plan = self._build_paged_plan(request_metadata)
             if kv_cache is None or kv_cache.token_count == 0:
                 prepared.append(
-                    AttentionInputs(input_ids=input_ids, past_key_values=None, metadata=request_metadata)
+                    AttentionInputs(
+                        input_ids=input_ids,
+                        past_key_values=None,
+                        metadata=request_metadata,
+                        paged_plan=paged_plan,
+                    )
                 )
                 continue
-            legacy_cache = self._to_past_key_values(kv_cache)
+            legacy_cache = self._to_past_key_values(kv_cache, paged_plan)
             prepared.append(
                 AttentionInputs(
                     input_ids=input_ids,
                     past_key_values=DynamicCache.from_legacy_cache(legacy_cache),
                     metadata=request_metadata,
+                    paged_plan=paged_plan,
                 )
             )
         return prepared
@@ -100,12 +123,15 @@ class HuggingFaceAttentionBackend(AttentionBackend):
     def _to_past_key_values(
         self,
         kv_cache: KVCacheView,
+        paged_plan: PagedAttentionPlan | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         layers = min(self.num_layers, kv_cache.keys.shape[0])
         heads = min(self.num_heads, kv_cache.keys.shape[2])
         dim = min(self.head_dim, kv_cache.keys.shape[3])
         past: list[tuple[torch.Tensor, torch.Tensor]] = []
         token_count = kv_cache.token_count
+        if paged_plan is not None:
+            token_count = min(token_count, paged_plan.token_count)
         for layer_idx in range(self.num_layers):
             key = torch.zeros(
                 (1, self.num_heads, token_count, self.head_dim),
@@ -120,3 +146,23 @@ class HuggingFaceAttentionBackend(AttentionBackend):
                 value[:, :heads, :, :dim] = src_value.to(device=self.device, dtype=self.dtype).unsqueeze(0)
             past.append((key, value))
         return tuple(past)
+
+    def _build_paged_plan(
+        self,
+        metadata: MaterializedBatchMetadata | None,
+    ) -> PagedAttentionPlan | None:
+        if metadata is None or not metadata.request_table_states:
+            return None
+        state = metadata.request_table_states[0]
+        return self._plan_from_state(state)
+
+    def _plan_from_state(self, state: RequestTableState) -> PagedAttentionPlan:
+        page_count = (state.token_count + self.page_size - 1) // self.page_size
+        return PagedAttentionPlan(
+            table_slot=state.table_slot,
+            page_ids=tuple(state.page_ids[:page_count]),
+            token_ids=tuple(token_id for token_id in state.token_ids[: state.token_count] if token_id is not None),
+            token_count=state.token_count,
+            write_position=state.write_position,
+            page_size=self.page_size,
+        )

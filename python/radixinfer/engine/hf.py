@@ -22,6 +22,7 @@ class HuggingFaceEngine:
     kv_num_layers: int = 2
     kv_num_heads: int = 2
     kv_cache_dim: int = 16
+    page_size: int = 16
 
     def __post_init__(self) -> None:
         self.device = _resolve_device(self.device)
@@ -40,6 +41,7 @@ class HuggingFaceEngine:
             num_layers=num_layers,
             num_heads=num_heads,
             head_dim=head_dim,
+            page_size=self.page_size,
             device=self.device,
             dtype=self.model.dtype,
         )
