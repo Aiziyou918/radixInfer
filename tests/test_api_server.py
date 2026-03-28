@@ -1,22 +1,70 @@
 import asyncio
+from dataclasses import dataclass
 
 import httpx
 
-from radixinfer.api.server import create_app
+from radixinfer.api.server import AppState, create_app
 from radixinfer.config import ServerConfig
+from radixinfer.transport.protocol import SamplingParams, StreamChunk
+
+# FakeAppState injects synthetic token streams without spawning any subprocesses.
+# Tokens are characters from _FAKE_TEXT, so stop="b" triggers after "a".
+_FAKE_TEXT = "abcdefghijklmnopqrstuvwxyz"
+
+
+@dataclass
+class FakeAppState(AppState):
+    def start(self) -> None:
+        pass
+
+    async def start_listener(self) -> None:
+        pass
+
+    def submit_request(
+        self,
+        request_id: int,
+        prompt: str,
+        sampling: SamplingParams,
+        messages: list | None = None,
+    ) -> None:
+        asyncio.create_task(self._inject(request_id, sampling.max_tokens))
+
+    async def _inject(self, request_id: int, n: int) -> None:
+        # Yield once so the endpoint handler can start waiting on output_queue.get()
+        await asyncio.sleep(0)
+        queue = self.listeners.get(request_id)
+        if queue is None:
+            return
+        for i in range(n):
+            finished = i == n - 1
+            await queue.put(
+                StreamChunk(
+                    request_id=request_id,
+                    token_id=i + 1,
+                    text=_FAKE_TEXT[i % len(_FAKE_TEXT)],
+                    finished=finished,
+                    finish_reason="length" if finished else "",
+                    prompt_tokens=2 if finished else 0,
+                    completion_tokens=n if finished else 0,
+                )
+            )
+
+    async def abort_request(self, request_id: int) -> None:
+        pass
+
+    async def shutdown(self) -> None:
+        pass
 
 
 def make_app():
-    return create_app(
-        ServerConfig(
-            model="debug",
-            engine_kind="dummy",
-            device="cpu",
-            start_method="inline",
-            max_prefill_tokens=8,
-            max_batch_size=4,
-        )
+    config = ServerConfig(
+        model="debug",
+        engine_kind="dummy",
+        device="cpu",
+        max_prefill_tokens=8,
+        max_batch_size=4,
     )
+    return create_app(config, state=FakeAppState(config=config))
 
 
 async def _request_json(method: str, path: str, payload: dict | None = None):
@@ -38,7 +86,7 @@ async def _request_stream(path: str, payload: dict):
                 return response, lines
 
 
-def test_models_endpoint_inline_mode() -> None:
+def test_models_endpoint() -> None:
     response = asyncio.run(_request_json("GET", "/v1/models"))
     assert response.status_code == 200
     payload = response.json()
@@ -46,7 +94,7 @@ def test_models_endpoint_inline_mode() -> None:
     assert payload["data"][0]["owned_by"] == "radixinfer"
 
 
-def test_nonstream_completion_inline_mode() -> None:
+def test_nonstream_completion() -> None:
     response = asyncio.run(
         _request_json(
             "POST",
@@ -67,7 +115,7 @@ def test_nonstream_completion_inline_mode() -> None:
     assert payload["usage"]["total_tokens"] == payload["usage"]["prompt_tokens"] + 3
 
 
-def test_stream_completion_inline_mode() -> None:
+def test_stream_completion() -> None:
     response, lines = asyncio.run(
         _request_stream(
             "/v1/chat/completions",
@@ -101,6 +149,7 @@ def test_stream_completion_can_include_usage_on_final_chunk() -> None:
 
 
 def test_nonstream_completion_respects_stop_sequence() -> None:
+    # FakeAppState emits "a", "b", "c", ... so stop="b" truncates after "a"
     response = asyncio.run(
         _request_json(
             "POST",
@@ -110,14 +159,14 @@ def test_nonstream_completion_respects_stop_sequence() -> None:
                 "prompt": "hi",
                 "max_tokens": 6,
                 "stream": False,
-                "stop": "?",
+                "stop": "b",
             },
         )
     )
     assert response.status_code == 200
     payload = response.json()
     assert payload["choices"][0]["finish_reason"] == "stop"
-    assert "?" not in payload["choices"][0]["message"]["content"]
+    assert "b" not in payload["choices"][0]["message"]["content"]
 
 
 def test_stream_completion_respects_stop_sequence() -> None:
@@ -129,14 +178,14 @@ def test_stream_completion_respects_stop_sequence() -> None:
                 "prompt": "hi",
                 "max_tokens": 6,
                 "stream": True,
-                "stop": "?",
+                "stop": "b",
             },
         )
     )
     assert response.status_code == 200
     payloads = [line.removeprefix("data: ") for line in lines if line.startswith("data: {")]
     assert any('"finish_reason": "stop"' in payload for payload in payloads)
-    assert all('"content": "?"' not in payload for payload in payloads)
+    assert all('"content": "b"' not in payload for payload in payloads)
 
 
 def test_chat_completions_rejects_n_greater_than_one() -> None:

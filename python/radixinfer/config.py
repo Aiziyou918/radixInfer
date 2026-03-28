@@ -28,7 +28,6 @@ class ServerConfig:
     default_max_tokens: int = 64
     tokenizer_name: str | None = None
     device: str = "auto"
-    start_method: str = "spawn"
     use_zmq: bool = True
     stop_token_ids: tuple[int, ...] = field(default_factory=tuple)
     _unique_suffix: str = field(default_factory=lambda: f".pid={os.getpid()}")

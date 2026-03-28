@@ -6,7 +6,6 @@ import multiprocessing as mp
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from queue import Empty, Queue
 from typing import Any
 
 try:
@@ -24,16 +23,15 @@ except ModuleNotFoundError:
         pass
 
 from radixinfer.config import ServerConfig
-from radixinfer.runtime.scheduler import SchedulerRuntime, start_runtime_process
+from radixinfer.runtime.scheduler import start_runtime_process
 from radixinfer.transport.queues import make_zmq_pull, make_zmq_push
 from radixinfer.transport.protocol import (
     AbortRequest,
     SamplingParams,
     StreamChunk,
     TokenizeRequest,
-    TokenizedRequest,
 )
-from radixinfer.transport.tokenizer_worker import create_tokenizer_backend, start_tokenizer_process
+from radixinfer.transport.tokenizer_worker import start_tokenizer_process
 from radixinfer.utils.mp import has_zmq
 
 
@@ -101,30 +99,8 @@ class AppState:
     runtime_process: mp.Process | None = None
     listeners: dict[int, asyncio.Queue[StreamChunk]] = field(default_factory=dict)
     listen_task: asyncio.Task | None = None
-    inline_runtime: SchedulerRuntime | None = None
-    inline_tokenizer: Any | None = None
-    inline_detok_manager: Any | None = None  # DetokenizeManager for inline mode
-    inline_tasks: set[asyncio.Task] = field(default_factory=set)
-    # Shared completion set: whichever pump call consumes the finished chunk writes
-    # request_id here so _run_inline_request() can always see it.
-    _inline_completed: set[int] = field(default_factory=set)
-
-    @property
-    def inline_mode(self) -> bool:
-        return self.config.start_method == "inline"
 
     def start(self) -> None:
-        if self.inline_mode:
-            from radixinfer.transport.detokenize import DetokenizeManager
-
-            self.inline_tokenizer = create_tokenizer_backend(self.config.tokenizer_name or self.config.model)
-            self.inline_detok_manager = DetokenizeManager(self.inline_tokenizer)
-            self.inline_runtime = SchedulerRuntime(
-                self.config,
-                self.runtime_ingress,
-                self.tokenizer_ingress,
-            )
-            return
         if self.config.use_zmq and has_zmq():
             self.tokenizer_ingress = make_zmq_push(self.config.zmq_tokenizer_addr, create=False)
             self.runtime_ingress = make_zmq_push(self.config.zmq_backend_addr, create=False)
@@ -151,15 +127,19 @@ class AppState:
                 pass  # Proceed even if ack times out (e.g. debug/dummy engine)
 
     async def start_listener(self) -> None:
-        if self.inline_mode:
-            return
         if self.listen_task is None:
             self.listen_task = asyncio.create_task(self._listen_frontend())
 
     async def _listen_frontend(self) -> None:
+        from queue import Empty
+
         try:
             while True:
-                chunk = await asyncio.to_thread(self.frontend_queue.get)
+                try:
+                    chunk = self.frontend_queue.get_nowait()
+                except Empty:
+                    await asyncio.sleep(0.001)
+                    continue
                 if chunk is None:
                     return
                 queue = self.listeners.get(chunk.request_id)
@@ -180,13 +160,6 @@ class AppState:
         sampling: SamplingParams,
         messages: list | None = None,
     ) -> None:
-        if self.inline_mode:
-            task = asyncio.create_task(
-                self._run_inline_request(request_id, prompt, sampling, messages=messages)
-            )
-            self.inline_tasks.add(task)
-            task.add_done_callback(self.inline_tasks.discard)
-            return
         self.tokenizer_ingress.put(
             TokenizeRequest(
                 request_id=request_id,
@@ -198,85 +171,6 @@ class AppState:
 
     async def abort_request(self, request_id: int) -> None:
         self.runtime_ingress.put(AbortRequest(request_id=request_id))
-        # In inline mode _run_inline_request processes the AbortRequest on its
-        # next _pump_inline_runtime call and exits cleanly.  Do NOT pump here or
-        # the finished marker gets consumed before _run_inline_request sees it.
-
-    async def _run_inline_request(
-        self,
-        request_id: int,
-        prompt: str,
-        sampling: SamplingParams,
-        messages: list | None = None,
-    ) -> None:
-        assert self.inline_runtime is not None
-        assert self.inline_tokenizer is not None
-        if messages is not None and hasattr(self.inline_tokenizer, "encode_messages"):
-            token_ids = self.inline_tokenizer.encode_messages(messages)
-        else:
-            token_ids = self.inline_tokenizer.encode(prompt)
-        self.runtime_ingress.put(
-            TokenizedRequest(
-                request_id=request_id,
-                token_ids=token_ids,
-                sampling=sampling,
-                eos_token_id=getattr(self.inline_tokenizer, "eos_token_id", None),
-                stop_token_ids=getattr(self.inline_tokenizer, "stop_token_ids", ()),
-            )
-        )
-        try:
-            while True:
-                # Check _inline_completed BEFORE pumping so we catch completions
-                # that were written by a concurrent abort_request() pump call.
-                if request_id in self._inline_completed:
-                    return
-                await self._pump_inline_runtime()
-                if request_id in self._inline_completed:
-                    return
-                await asyncio.sleep(self.config.scheduler_tick_interval)
-        finally:
-            self._inline_completed.discard(request_id)
-
-    async def _pump_inline_runtime(self) -> None:
-        assert self.inline_runtime is not None
-        assert self.inline_tokenizer is not None
-        assert self.inline_detok_manager is not None
-        self.inline_runtime._drain_ingress()
-        self.inline_runtime._tick()
-
-        # Collect all pending DetokenizeRequests
-        pending_detok = []
-        while True:
-            try:
-                detok = self.tokenizer_ingress.get_nowait()
-            except Empty:
-                break
-            if detok is None:
-                continue
-            pending_detok.append(detok)
-
-        if not pending_detok:
-            return
-
-        # Batch-incremental detokenize
-        texts = self.inline_detok_manager.detokenize(pending_detok)
-        for detok, text in zip(pending_detok, texts):
-            chunk = StreamChunk(
-                request_id=detok.request_id,
-                token_id=detok.token_id,
-                text=text,
-                finished=detok.finished,
-                finish_reason=detok.finish_reason,
-                prompt_tokens=detok.prompt_tokens,
-                completion_tokens=detok.completion_tokens,
-            )
-            listener = self.listeners.get(chunk.request_id)
-            if listener is not None:
-                await listener.put(chunk)
-            if chunk.finished:
-                # Write to the shared set so _run_inline_request() always sees
-                # the completion even when abort_request() consumed this chunk.
-                self._inline_completed.add(chunk.request_id)
 
     async def collect_response(
         self,
@@ -297,24 +191,21 @@ class AppState:
         return "".join(parts), finish_reason, usage
 
     async def shutdown(self) -> None:
-        if self.inline_tasks:
-            await asyncio.gather(*list(self.inline_tasks), return_exceptions=True)
-        if self.inline_mode:
-            return
         self.tokenizer_ingress.put(None)
         self.runtime_ingress.put(None)
-        if self.config.use_zmq and has_zmq():
-            if self.listen_task is not None:
-                self.listen_task.cancel()
-                await asyncio.gather(self.listen_task, return_exceptions=True)
-        else:
-            self.frontend_queue.put(None)
-            if self.listen_task is not None:
-                await self.listen_task
+        if self.listen_task is not None:
+            self.listen_task.cancel()
+            await asyncio.gather(self.listen_task, return_exceptions=True)
         if self.tokenizer_process is not None:
             self.tokenizer_process.join(timeout=1)
         if self.runtime_process is not None:
             self.runtime_process.join(timeout=1)
+        # Destroy ZMQ context so its I/O threads don't block process exit.
+        try:
+            import zmq
+            zmq.Context.instance().destroy(linger=0)
+        except Exception:
+            pass
 
 
 def _flatten_prompt(request: ChatCompletionRequest) -> str:
@@ -473,17 +364,10 @@ def _build_text_stream_payload(
     }
 
 
-def create_app(config: ServerConfig) -> FastAPI:
+def create_app(config: ServerConfig, state: AppState | None = None) -> FastAPI:
     if FastAPI is None or Request is None or StreamingResponse is None:
         raise RuntimeError("FastAPI dependencies are not installed. Install project dependencies first.")
-    if config.start_method == "inline":
-        state = AppState(
-            config=config,
-            tokenizer_ingress=Queue(),
-            runtime_ingress=Queue(),
-            frontend_queue=Queue(),
-        )
-    else:
+    if state is None:
         state = AppState(config=config)
 
     @asynccontextmanager
