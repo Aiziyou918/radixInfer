@@ -53,23 +53,7 @@ class HuggingFaceAttentionBackend(AttentionBackend):
         kv_caches = kv_caches or [None] * len(token_ids)
         for index, (request_tokens, kv_cache) in enumerate(zip(token_ids, kv_caches, strict=True)):
             input_ids = torch.tensor([request_tokens], dtype=torch.long, device=self.device)
-            request_metadata = None
-            if metadata is not None:
-                request_metadata = MaterializedBatchMetadata(
-                    positions=[metadata.positions[index]] if index < len(metadata.positions) else [],
-                    input_table_slots=(
-                        [metadata.input_table_slots[index]] if index < len(metadata.input_table_slots) else []
-                    ),
-                    input_positions=(
-                        [metadata.input_positions[index]] if index < len(metadata.input_positions) else []
-                    ),
-                    write_table_slots=(
-                        [metadata.write_table_slots[index]] if index < len(metadata.write_table_slots) else []
-                    ),
-                    write_positions=(
-                        [metadata.write_positions[index]] if index < len(metadata.write_positions) else []
-                    ),
-                )
+            request_metadata = metadata.request_view(index) if metadata is not None else None
             if kv_cache is None or kv_cache.token_count == 0:
                 prepared.append(
                     AttentionInputs(input_ids=input_ids, past_key_values=None, metadata=request_metadata)

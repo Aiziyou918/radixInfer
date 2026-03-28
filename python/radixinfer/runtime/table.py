@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from radixinfer.engine.base import RequestTableState
+
 
 @dataclass
 class TableManager:
@@ -44,3 +46,12 @@ class TableManager:
     def append_token(self, slot: int, position: int, page_id: int, token_id: int) -> None:
         self.token_table[slot][position] = token_id
         self.page_table[slot][position] = page_id
+
+    def request_state(self, slot: int, token_count: int, write_position: int) -> RequestTableState:
+        return RequestTableState(
+            table_slot=slot,
+            token_count=token_count,
+            write_position=write_position,
+            page_ids=tuple(self.page_table[slot][:token_count]),
+            token_ids=tuple(self.token_table[slot][:token_count]),
+        )

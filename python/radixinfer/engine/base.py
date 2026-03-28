@@ -7,6 +7,15 @@ from radixinfer.cache.page_pool import KVCacheView
 
 
 @dataclass(frozen=True)
+class RequestTableState:
+    table_slot: int
+    token_count: int
+    write_position: int
+    page_ids: tuple[int | None, ...] = field(default_factory=tuple)
+    token_ids: tuple[int | None, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class MaterializedBatchMetadata:
     positions: tuple[int, ...] = field(default_factory=tuple)
     input_table_slots: tuple[int, ...] = field(default_factory=tuple)
@@ -14,6 +23,24 @@ class MaterializedBatchMetadata:
     write_table_slots: tuple[int, ...] = field(default_factory=tuple)
     write_positions: tuple[int, ...] = field(default_factory=tuple)
     request_token_counts: tuple[int, ...] = field(default_factory=tuple)
+    request_table_states: tuple[RequestTableState, ...] = field(default_factory=tuple)
+
+    def request_slice(self, index: int) -> slice:
+        start = sum(self.request_token_counts[:index])
+        end = start + self.request_token_counts[index]
+        return slice(start, end)
+
+    def request_view(self, index: int) -> "MaterializedBatchMetadata":
+        request_slice = self.request_slice(index)
+        return MaterializedBatchMetadata(
+            positions=self.positions[request_slice],
+            input_table_slots=self.input_table_slots[request_slice],
+            input_positions=self.input_positions[request_slice],
+            write_table_slots=self.write_table_slots[index : index + 1],
+            write_positions=self.write_positions[index : index + 1],
+            request_token_counts=self.request_token_counts[index : index + 1],
+            request_table_states=self.request_table_states[index : index + 1],
+        )
 
 
 @dataclass(frozen=True)
