@@ -65,11 +65,14 @@ class SchedulerRuntime:
                 prefix_hit = self.prefix_store.match(item.token_ids)
                 request.prefix_matched = prefix_hit.matched_tokens
                 request.prefix_span = prefix_hit.cached_span
+                request.prefix_cache_key = prefix_hit.cache_key
+                self.prefix_store.lock(request.prefix_cache_key)
                 self.requests[item.request_id] = request
             elif isinstance(item, AbortRequest):
                 request = self.requests.get(item.request_id)
                 if request is not None and not request.finished:
                     request.phase = RequestPhase.ABORTED
+                    self.prefix_store.unlock(request.prefix_cache_key)
                     if request.reservation is not None:
                         self.page_pool.release(request.reservation)
                         request.reservation = None
@@ -101,30 +104,25 @@ class SchedulerRuntime:
         remaining_budget = self.config.max_prefill_tokens
         for request_id in request_ids:
             request = self.requests[request_id]
-            if request.finished or request.prefill_complete:
+            if request.finished:
                 continue
             if request.reservation is None:
                 total_reserved = len(request.prompt_tokens) + request.sampling.max_tokens
-                reservation = self.page_pool.reserve_for_tokens(total_reserved)
+                reservation = self.page_pool.reserve_for_tokens(
+                    total_reserved,
+                    prefix_span=request.prefix_span,
+                )
                 if reservation is None:
                     continue
                 request.reservation = reservation
                 request.reserved_tokens = total_reserved
                 if request.prefix_span is not None:
-                    cached_prefix = self.page_pool.read_span(request.prefix_span)
-                    request.cache_span = self.page_pool.write_tokens(
-                        reservation,
-                        cached_prefix,
-                        start_offset=0,
-                    )
-                    prefix_kv = self.page_pool.read_kv(request.prefix_span)
-                    if prefix_kv.token_count > 0:
-                        request.cache_span = self.page_pool.write_kv(
-                            reservation,
-                            prefix_kv.keys,
-                            prefix_kv.values,
-                            start_offset=0,
-                        )
+                    request.cache_span = request.prefix_span
+            if request.prefill_complete:
+                request.phase = RequestPhase.READY_TO_DECODE
+                if request.prefix_span is not None:
+                    request.cache_span = request.prefix_span
+                continue
 
             chunk_tokens = min(request.remaining_prefill_tokens, remaining_budget)
             if chunk_tokens <= 0:
@@ -164,7 +162,14 @@ class SchedulerRuntime:
                     )
                 request.cache_span = cache_span
                 request.prefix_span = cache_span
-                self.prefix_store.insert(prefix_tokens, cache_span)
+                self.page_pool.share_span(cache_span)
+                new_key, evicted_spans = self.prefix_store.insert(prefix_tokens, cache_span)
+                for evicted_span in evicted_spans:
+                    self.page_pool.evict_shared(evicted_span)
+                if new_key is not None and new_key != request.prefix_cache_key:
+                    self.prefix_store.unlock(request.prefix_cache_key)
+                    request.prefix_cache_key = new_key
+                    self.prefix_store.lock(request.prefix_cache_key)
             if remaining_budget <= 0:
                 break
 
@@ -231,6 +236,7 @@ class SchedulerRuntime:
                 finish_reason = "length"
             if finished:
                 request.phase = RequestPhase.FINISHED
+                self.prefix_store.unlock(request.prefix_cache_key)
                 if request.reservation is not None:
                     self.page_pool.release(request.reservation)
                     request.reservation = None

@@ -20,13 +20,18 @@ class KVCacheView:
 
 @dataclass
 class PageReservation:
-    page_ids: list[int]
+    private_page_ids: list[int]
     token_count: int
+    shared_page_ids: tuple[int, ...] = ()
     committed_tokens: int = 0
 
     @property
     def capacity_tokens(self) -> int:
         return len(self.page_ids) * self.token_count
+
+    @property
+    def page_ids(self) -> list[int]:
+        return list(self.shared_page_ids) + self.private_page_ids
 
 
 @dataclass
@@ -38,12 +43,14 @@ class PagePool:
     kv_num_heads: int = 2
     _free_pages: list[int] = field(init=False)
     _page_data: dict[int, list[int]] = field(init=False)
+    _shared_page_refcounts: dict[int, int] = field(init=False)
     _key_cache: torch.Tensor = field(init=False)
     _value_cache: torch.Tensor = field(init=False)
 
     def __post_init__(self) -> None:
         self._free_pages = list(range(self.total_pages))
         self._page_data = {page_id: [] for page_id in range(self.total_pages)}
+        self._shared_page_refcounts = {page_id: 0 for page_id in range(self.total_pages)}
         self._key_cache = torch.zeros(
             (
                 self.kv_num_layers,
@@ -60,13 +67,24 @@ class PagePool:
     def free_pages(self) -> int:
         return len(self._free_pages)
 
-    def reserve_for_tokens(self, token_count: int) -> PageReservation | None:
+    def reserve_for_tokens(
+        self,
+        token_count: int,
+        *,
+        prefix_span: PageSpan | None = None,
+    ) -> PageReservation | None:
         needed = max(1, (token_count + self.page_size - 1) // self.page_size)
-        if needed > len(self._free_pages):
+        shared_page_ids = prefix_span.page_ids if prefix_span is not None else ()
+        private_needed = max(0, needed - len(shared_page_ids))
+        if private_needed > len(self._free_pages):
             return None
-        page_ids = self._free_pages[:needed]
-        del self._free_pages[:needed]
-        return PageReservation(page_ids=page_ids, token_count=self.page_size)
+        private_page_ids = self._free_pages[:private_needed]
+        del self._free_pages[:private_needed]
+        return PageReservation(
+            private_page_ids=private_page_ids,
+            shared_page_ids=shared_page_ids,
+            token_count=self.page_size,
+        )
 
     def write_tokens(
         self,
@@ -177,10 +195,34 @@ class PagePool:
         used_pages = (reservation.committed_tokens + self.page_size - 1) // self.page_size
         return PageSpan(page_ids=tuple(reservation.page_ids[:used_pages]), token_count=reservation.committed_tokens)
 
+    def share_span(self, span: PageSpan) -> None:
+        for page_id in span.page_ids:
+            self._shared_page_refcounts[page_id] += 1
+
+    def evict_shared(self, span: PageSpan) -> None:
+        for page_id in span.page_ids:
+            refs = self._shared_page_refcounts[page_id]
+            if refs <= 0:
+                raise ValueError(f"page {page_id} is not shared")
+            refs -= 1
+            self._shared_page_refcounts[page_id] = refs
+            if refs == 0 and page_id not in self._free_pages:
+                self._page_data[page_id] = []
+                self._key_cache[:, page_id].zero_()
+                self._value_cache[:, page_id].zero_()
+                self._free_pages.append(page_id)
+        self._free_pages.sort()
+
     def release(self, reservation: PageReservation) -> None:
-        for page_id in reservation.page_ids:
+        for page_id in reservation.private_page_ids:
+            if self._shared_page_refcounts[page_id] > 0:
+                continue
             self._page_data[page_id] = []
             self._key_cache[:, page_id].zero_()
             self._value_cache[:, page_id].zero_()
-        self._free_pages.extend(reservation.page_ids)
+            if page_id not in self._free_pages:
+                self._free_pages.append(page_id)
         self._free_pages.sort()
+
+    def shared_refcount(self, page_id: int) -> int:
+        return self._shared_page_refcounts[page_id]

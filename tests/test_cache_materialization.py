@@ -4,7 +4,7 @@ import torch
 
 from radixinfer.config import ServerConfig
 from radixinfer.runtime.scheduler import SchedulerRuntime
-from radixinfer.runtime.types import RuntimeRequest
+from radixinfer.runtime.types import RequestPhase, RuntimeRequest
 from radixinfer.transport.protocol import SamplingParams
 
 
@@ -59,7 +59,7 @@ def test_prefix_match_returns_cached_span_for_following_request() -> None:
     assert runtime.page_pool.read_span(hit.cached_span) == [1, 2, 3, 4]
 
 
-def test_matched_prefix_is_copied_into_request_cache_reservation() -> None:
+def test_matched_prefix_reuses_shared_pages_in_request_cache_reservation() -> None:
     runtime = SchedulerRuntime(
         ServerConfig(
             model="debug",
@@ -79,6 +79,8 @@ def test_matched_prefix_is_copied_into_request_cache_reservation() -> None:
     )
     runtime.requests[1] = req1
     runtime._run_prefill([1])
+    assert req1.prefix_cache_key is not None
+    assert runtime.prefix_store.entry_ref_count(req1.prefix_cache_key) == 1
 
     req2 = RuntimeRequest(
         request_id=2,
@@ -90,7 +92,11 @@ def test_matched_prefix_is_copied_into_request_cache_reservation() -> None:
     runtime.requests[2] = req2
     runtime._run_prefill([2])
     assert req2.cache_span is not None
+    assert req2.reservation is not None
+    assert req2.reservation.shared_page_ids == req1.prefix_span.page_ids  # type: ignore[union-attr]
     assert runtime.page_pool.read_span(req2.cache_span) == [1, 2, 3, 4, 5, 6]
+    for page_id in req1.prefix_span.page_ids:  # type: ignore[union-attr]
+        assert runtime.page_pool.shared_refcount(page_id) >= 1
 
 
 def test_decode_appends_token_into_page_backed_cache() -> None:
@@ -184,3 +190,67 @@ def test_prefill_writes_real_kv_into_page_pool_for_hf_debug_engine() -> None:
     assert kv.token_count == 4
     assert torch.count_nonzero(kv.keys).item() > 0
     assert torch.count_nonzero(kv.values).item() > 0
+
+
+def test_finished_request_unlocks_prefix_entry_but_keeps_shared_cache_resident() -> None:
+    runtime = SchedulerRuntime(
+        ServerConfig(
+            model="debug",
+            engine_kind="dummy",
+            max_prefill_tokens=8,
+            max_batch_size=2,
+            page_size=2,
+            total_pages=16,
+        ),
+        Queue(),
+        Queue(),
+    )
+    req = RuntimeRequest(
+        request_id=5,
+        prompt_tokens=[11, 12, 13, 14],
+        sampling=SamplingParams(max_tokens=1),
+    )
+    runtime.requests[5] = req
+    runtime._run_prefill([5])
+    assert req.prefix_cache_key is not None
+    runtime.engine.decode = lambda batch: type("Out", (), {"next_token_ids": [99]})()  # type: ignore[method-assign]
+    runtime._run_decode([5])
+    assert runtime.prefix_store.entry_ref_count(req.prefix_cache_key) == 0
+    assert req.prefix_span is not None
+    assert runtime.page_pool.read_span(req.prefix_span) == [11, 12, 13, 14]
+
+
+def test_full_prefix_hit_becomes_decode_ready_without_copying_prefix() -> None:
+    runtime = SchedulerRuntime(
+        ServerConfig(
+            model="debug",
+            engine_kind="dummy",
+            max_prefill_tokens=8,
+            max_batch_size=2,
+            page_size=2,
+            total_pages=16,
+        ),
+        Queue(),
+        Queue(),
+    )
+    req1 = RuntimeRequest(
+        request_id=6,
+        prompt_tokens=[1, 2, 3, 4],
+        sampling=SamplingParams(max_tokens=2),
+    )
+    runtime.requests[6] = req1
+    runtime._run_prefill([6])
+
+    req2 = RuntimeRequest(
+        request_id=7,
+        prompt_tokens=[1, 2, 3, 4],
+        sampling=SamplingParams(max_tokens=2),
+        prefix_matched=4,
+        prefix_span=req1.prefix_span,
+        prefix_cache_key=req1.prefix_cache_key,
+    )
+    runtime.prefix_store.lock(req2.prefix_cache_key)
+    runtime.requests[7] = req2
+    runtime._run_prefill([7])
+    assert req2.phase == RequestPhase.READY_TO_DECODE
+    assert req2.cache_span == req1.prefix_span
