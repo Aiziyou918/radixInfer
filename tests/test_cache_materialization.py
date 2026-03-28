@@ -30,6 +30,9 @@ def test_prefill_materializes_prompt_tokens_into_page_pool() -> None:
     runtime._run_prefill([1])
     assert req.prefix_span is not None
     assert runtime.page_pool.read_span(req.prefix_span) == [10, 11, 12, 13]
+    assert req.table_slot is not None
+    assert runtime.table_manager.token_table[req.table_slot][:4] == [10, 11, 12, 13]
+    assert runtime.table_manager.page_table[req.table_slot][:4] == [0, 0, 1, 1]
 
 
 def test_prefix_match_returns_cached_span_for_following_request() -> None:
@@ -159,6 +162,35 @@ def test_decode_input_carries_kv_cache_view() -> None:
     runtime._run_decode([3])
     assert seen["token_ids"] == [[10]]
     assert seen["kv_shapes"] == [((3, 3, 2, 8), (3, 3, 2, 8))]
+
+
+def test_executor_prepares_decode_metadata() -> None:
+    runtime = SchedulerRuntime(
+        ServerConfig(
+            model="debug",
+            engine_kind="dummy",
+            max_prefill_tokens=8,
+            max_batch_size=2,
+            page_size=2,
+            total_pages=16,
+        ),
+        Queue(),
+        Queue(),
+    )
+    req = RuntimeRequest(
+        request_id=8,
+        prompt_tokens=[21, 22, 23, 24],
+        sampling=SamplingParams(max_tokens=2),
+    )
+    runtime.requests[8] = req
+    runtime._run_prefill([8])
+    prepared = runtime.executor.prepare_decode_batch([req])
+    assert prepared.decode_input.token_ids == [[24]]
+    assert prepared.metadata.positions == [3]
+    assert prepared.metadata.input_table_slots == [req.table_slot]
+    assert prepared.metadata.input_positions == [3]
+    assert prepared.metadata.write_table_slots == [req.table_slot]
+    assert prepared.metadata.write_positions == [4]
 
 
 def test_prefill_writes_real_kv_into_page_pool_for_hf_debug_engine() -> None:

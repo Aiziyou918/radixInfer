@@ -211,7 +211,8 @@ class SchedulerRuntime:
                 request.phase = RequestPhase.DECODING
             if request.cache_span is None:
                 raise RuntimeError("decode request is missing active cache state")
-        output = self.engine.decode(self.executor.prepare_decode_input(selected))
+        prepared = self.executor.prepare_decode_batch(selected)
+        output = self.engine.decode(prepared.decode_input)
         kv_writes = getattr(output, "kv_writes", [None] * len(selected))
         for request, token_id, kv_write in zip(
             selected, output.next_token_ids, kv_writes, strict=True
