@@ -32,8 +32,6 @@ def test_real_multiprocess_server_path() -> None:
         "radixinfer.serve",
         "--model",
         "debug",
-        "--engine",
-        "dummy",
         "--device",
         "cpu",
         "--port",

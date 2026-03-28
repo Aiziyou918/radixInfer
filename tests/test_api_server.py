@@ -59,7 +59,6 @@ class FakeAppState(AppState):
 def make_app():
     config = ServerConfig(
         model="debug",
-        engine_kind="dummy",
         device="cpu",
         max_prefill_tokens=8,
         max_batch_size=4,

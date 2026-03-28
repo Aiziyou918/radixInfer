@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -16,11 +15,7 @@ class ServerConfig:
     max_prefill_tokens: int = 2048
     page_size: int = 16
     total_pages: int = 4096
-    kv_cache_dim: int = 16
-    kv_num_layers: int = 2
-    kv_num_heads: int = 2
     max_batch_size: int = 32
-    engine_kind: Literal["dummy", "hf", "real"] = "hf"
     prefix_cache_capacity: int = 4096
     queue_poll_interval: float = 0.005
     scheduler_tick_interval: float = 0.001
@@ -59,8 +54,6 @@ def server_config_to_scheduler_config(cfg: ServerConfig):
     from radixinfer.distributed import DistributedInfo
     from radixinfer.runtime.scheduler_config import SchedulerConfig
 
-    use_dummy = cfg.engine_kind in ("dummy",) or cfg.model in ("debug", "dummy")
-
     return SchedulerConfig(
         model_path=cfg.model,
         tp_info=DistributedInfo(rank=0, size=cfg.tp_size),
@@ -69,7 +62,6 @@ def server_config_to_scheduler_config(cfg: ServerConfig):
         max_running_req=cfg.max_running_requests,
         num_page_override=cfg.total_pages,
         max_extend_tokens=cfg.max_prefill_tokens,
-        use_dummy_weight=use_dummy,
         dist_port=cfg.dist_port,
         _unique_suffix=cfg._unique_suffix,
         # SchedulerRuntime handles all I/O itself (queue.Queue bridging); the
