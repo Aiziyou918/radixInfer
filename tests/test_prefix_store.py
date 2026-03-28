@@ -37,3 +37,13 @@ def test_prefix_store_evicts_only_unlocked_entries_when_over_capacity() -> None:
     key3, evicted3 = store.insert([5, 6], PageSpan(page_ids=(2,), token_count=2))
     assert key3 is not None
     assert evicted3 == [PageSpan(page_ids=(0,), token_count=2)]
+
+
+def test_prefix_store_splits_existing_branch_on_partial_match() -> None:
+    store = PrefixStore(capacity=4, page_size=2)
+    key1, _ = store.insert([1, 2, 3, 4, 5, 6], PageSpan(page_ids=(0, 1, 2), token_count=6))
+    assert key1 is not None
+    hit = store.match([1, 2, 3, 4, 9, 10])
+    assert hit.matched_tokens == 4
+    assert hit.cached_span == PageSpan(page_ids=(0, 1), token_count=4)
+    assert hit.cache_key is not None
