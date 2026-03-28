@@ -56,7 +56,9 @@ class SchedulerRuntime:
                     eos_token_id=item.eos_token_id,
                     stop_token_ids=item.stop_token_ids,
                 )
-                request.prefix_matched = self.prefix_store.match(item.token_ids).matched_tokens
+                prefix_hit = self.prefix_store.match(item.token_ids)
+                request.prefix_matched = prefix_hit.matched_tokens
+                request.prefix_span = prefix_hit.cached_span
                 self.requests[item.request_id] = request
             elif isinstance(item, AbortRequest):
                 request = self.requests.get(item.request_id)
@@ -110,7 +112,14 @@ class SchedulerRuntime:
 
             if request.prefill_complete:
                 request.phase = RequestPhase.READY_TO_DECODE
-                self.prefix_store.insert(request.prompt_tokens)
+                prefix_tokens = request.prompt_tokens[: request.prefix_matched + request.prefill_cursor]
+                prefix_span = self.page_pool.write_tokens(
+                    request.reservation,
+                    prefix_tokens[request.prefix_matched :],
+                    start_offset=request.prefix_matched,
+                )
+                request.prefix_span = prefix_span
+                self.prefix_store.insert(prefix_tokens, prefix_span)
             if remaining_budget <= 0:
                 break
 

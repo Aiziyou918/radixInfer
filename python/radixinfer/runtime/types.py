@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
-from radixinfer.cache.page_pool import PageReservation
+from radixinfer.cache.page_pool import PageReservation, PageSpan
 from radixinfer.transport.protocol import SamplingParams
 
 
@@ -26,6 +26,7 @@ class RuntimeRequest:
     phase: RequestPhase = RequestPhase.WAIT_PREFILL
     generated_tokens: list[int] = field(default_factory=list)
     prefix_matched: int = 0
+    prefix_span: PageSpan | None = None
     prefill_cursor: int = 0
     age: int = 0
     reserved_tokens: int = 0
