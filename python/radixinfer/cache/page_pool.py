@@ -236,3 +236,14 @@ class PagePool:
 
     def shared_refcount(self, page_id: int) -> int:
         return self._shared_page_refcounts[page_id]
+
+    def reclaim_span(self, span: PageSpan) -> None:
+        """Return the pages of an evicted span to the free pool."""
+        for page_id in span.page_ids:
+            self._page_data[page_id] = []
+            self._shared_page_refcounts[page_id] = 0
+            self._key_cache[:, page_id].zero_()
+            self._value_cache[:, page_id].zero_()
+            if page_id not in self._free_pages:
+                self._free_pages.append(page_id)
+        self._free_pages.sort()

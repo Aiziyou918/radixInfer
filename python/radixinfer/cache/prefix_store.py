@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import heapq
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import NamedTuple
+
+import torch
 
 from .page_pool import PageSpan
 
@@ -313,3 +317,307 @@ class PrefixStore:
                 f"expected evictable={evictable}, protected={protected}, "
                 f"got evictable={self._evictable_size}, protected={self._protected_size}"
             )
+
+
+# ---------------------------------------------------------------------------
+# mini-sglang compatible prefix cache interface
+# ---------------------------------------------------------------------------
+
+class BaseCacheHandle(ABC):
+    """Abstract handle returned by prefix cache match/insert operations."""
+
+    @property
+    @abstractmethod
+    def cached_len(self) -> int: ...
+
+    @abstractmethod
+    def get_matched_indices(self) -> torch.Tensor: ...
+
+
+class InsertResult(NamedTuple):
+    cached_len: int           # tokens already cached before this insert (to be freed)
+    handle: BaseCacheHandle   # handle pointing to the newly inserted node
+
+
+class MatchResult(NamedTuple):
+    cuda_handle: BaseCacheHandle
+
+
+class BasePrefixCache(ABC):
+    @abstractmethod
+    def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None: ...
+
+    @abstractmethod
+    def match_prefix(self, input_ids: torch.Tensor) -> MatchResult: ...
+
+    @abstractmethod
+    def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult: ...
+
+    @abstractmethod
+    def evict(self, size: int) -> torch.Tensor: ...
+
+    @abstractmethod
+    def reset(self) -> None: ...
+
+    @property
+    @abstractmethod
+    def size_info(self) -> SizeInfo: ...
+
+    @abstractmethod
+    def check_integrity(self) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# RadixTreeNode — torch-tensor-backed radix tree node
+# ---------------------------------------------------------------------------
+
+class RadixTreeNode:
+    _counter: int = 0
+
+    def __init__(self, key_fn, tic: int | None = None) -> None:
+        self.key_fn = key_fn
+        self.children: dict = {}
+        self._parent: RadixTreeNode | None = None
+        self.ref_count: int = 0
+        self.uuid: int = RadixTreeNode._counter
+        RadixTreeNode._counter += 1
+        self.timestamp: int = tic if tic is not None else time.monotonic_ns()
+        # Set later via set_key_value
+        self._key: torch.Tensor
+        self._value: torch.Tensor
+        self._length: int = 0
+
+    def set_key_value(self, key: torch.Tensor, value: torch.Tensor) -> None:
+        assert len(key) == len(value)
+        self._key = key
+        self._value = value
+        self._length = len(key)
+
+    def set_parent(self, parent: RadixTreeNode) -> None:
+        self._parent = parent
+        parent.children[self.key_fn(self._key)] = self
+
+    @property
+    def length(self) -> int:
+        return self._length
+
+    @property
+    def value(self) -> torch.Tensor:
+        return self._value
+
+    @property
+    def parent(self) -> RadixTreeNode:
+        assert self._parent is not None
+        return self._parent
+
+    def is_root(self) -> bool:
+        return self._parent is None
+
+    def is_leaf(self) -> bool:
+        return len(self.children) == 0
+
+    def get_match_len(self, input_ids: torch.Tensor) -> int:
+        from radixinfer.kernel import fast_compare_key
+        cmp_len = min(self._length, len(input_ids))
+        return fast_compare_key(self._key, input_ids, cmp_len)
+
+    def split_at(self, pos: int) -> RadixTreeNode:
+        assert 0 < pos < self.length
+        parent = self.parent
+
+        new_node = RadixTreeNode(self.key_fn, self.timestamp)
+        new_node.set_key_value(self._key[:pos], self._value[:pos])
+        new_node.set_parent(parent)
+        new_node.ref_count = self.ref_count
+
+        self.set_key_value(self._key[pos:], self._value[pos:])
+        self.set_parent(new_node)
+
+        return new_node
+
+    def __lt__(self, other: RadixTreeNode) -> bool:
+        return self.timestamp < other.timestamp
+
+
+# ---------------------------------------------------------------------------
+# RadixCacheHandle
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RadixCacheHandle(BaseCacheHandle):
+    _cached_len: int
+    node: RadixTreeNode
+
+    @property
+    def cached_len(self) -> int:
+        return self._cached_len
+
+    def get_matched_indices(self) -> torch.Tensor:
+        node = self.node
+        parts: list[torch.Tensor] = []
+        while not node.is_root():
+            parts.append(node.value)
+            node = node.parent
+        if not parts:
+            return torch.empty(0, dtype=torch.int32)
+        parts.reverse()
+        return torch.cat(parts)
+
+
+# ---------------------------------------------------------------------------
+# RadixPrefixCache — mini-sglang compatible BasePrefixCache implementation
+# ---------------------------------------------------------------------------
+
+def _get_key_fn(page_size: int):
+    if page_size == 1:
+        return lambda x: int(x[0].item())
+    return lambda x: tuple(x[:page_size].tolist())
+
+
+class RadixPrefixCache(BasePrefixCache):
+    """Radix-tree prefix cache using torch tensors for keys/values.
+
+    Implements the same interface as mini-sglang's RadixPrefixCache so that
+    CacheManager can use it without modification.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        from radixinfer.core import get_global_ctx
+        from radixinfer.utils import align_down as _align_down
+
+        ctx = get_global_ctx()
+        self.device = device
+        self.page_size = ctx.page_size
+        self._key_fn = _get_key_fn(self.page_size)
+        self._align_down = _align_down
+        self._empty = torch.empty(0, dtype=torch.int32, device=device)
+        self._evictable_size = 0
+        self._protected_size = 0
+        self._root = RadixTreeNode(self._key_fn)
+        self._root.ref_count = 1  # root is always protected
+
+    # ------------------------------------------------------------------
+    # BasePrefixCache interface
+    # ------------------------------------------------------------------
+
+    def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
+        assert isinstance(handle, RadixCacheHandle)
+        node = handle.node
+        if unlock:
+            while not node.is_root():
+                node.ref_count -= 1
+                assert node.ref_count >= 0
+                if node.ref_count == 0:
+                    self._evictable_size += node.length
+                    self._protected_size -= node.length
+                node = node.parent
+        else:
+            while not node.is_root():
+                if node.ref_count == 0:
+                    self._evictable_size -= node.length
+                    self._protected_size += node.length
+                node.ref_count += 1
+                node = node.parent
+
+    def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
+        ids = input_ids.cpu().to(torch.int32)
+        node, prefix_len = self._tree_walk(ids)
+        return MatchResult(RadixCacheHandle(prefix_len, node))
+
+    def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
+        insert_len = self._align_down(len(input_ids), self.page_size)
+        input_ids = input_ids[:insert_len].cpu().to(torch.int32)
+        indices = indices[:insert_len].cpu().to(torch.int32)
+
+        node, prefix_len = self._tree_walk(input_ids)
+        if prefix_len != insert_len:
+            new_node = RadixTreeNode(self._key_fn)
+            new_node.set_key_value(
+                input_ids[prefix_len:].clone(),
+                indices[prefix_len:].clone(),
+            )
+            new_node.set_parent(node)
+            self._evictable_size += new_node.length
+            node = new_node
+        return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
+
+    def evict(self, size: int) -> torch.Tensor:
+        if size == 0:
+            return self._empty
+        assert size <= self._evictable_size, (
+            f"Cannot evict {size}, only {self._evictable_size} is evictable"
+        )
+
+        leaf_nodes = self._collect_evictable_leaves()
+        heapq.heapify(leaf_nodes)
+        evicted: list[torch.Tensor] = []
+        evicted_size = 0
+
+        while evicted_size < size:
+            assert leaf_nodes, (
+                f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
+            )
+            node = heapq.heappop(leaf_nodes)
+            assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
+            evicted_size += node.length
+            evicted.append(node.value)
+            self._evictable_size -= node.length
+            parent = node.parent
+            del parent.children[self._key_fn(node._key)]
+            if parent.is_leaf() and parent.ref_count == 0 and not parent.is_root():
+                heapq.heappush(leaf_nodes, parent)
+
+        return torch.cat(evicted).to(self.device)
+
+    def reset(self) -> None:
+        raise NotImplementedError("RadixPrefixCache.reset is not implemented")
+
+    @property
+    def size_info(self) -> SizeInfo:
+        return SizeInfo(
+            evictable_size=self._evictable_size,
+            protected_size=self._protected_size,
+        )
+
+    def check_integrity(self) -> None:
+        pass
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _tree_walk(self, input_ids: torch.Tensor) -> tuple[RadixTreeNode, int]:
+        prefix_len = 0
+        indice_len = len(input_ids)
+        node = self._root
+        tic = time.monotonic_ns()
+
+        while prefix_len < indice_len:
+            child_node = node.children.get(self._key_fn(input_ids[prefix_len:]))
+            if child_node is None:
+                return node, prefix_len
+            node = child_node
+
+            match_len = node.get_match_len(input_ids[prefix_len:])
+            match_len = self._align_down(match_len, self.page_size)
+            prefix_len += match_len
+
+            if match_len != node.length:
+                node = node.split_at(match_len)
+                return node, prefix_len
+
+            node.timestamp = tic
+
+        return node, prefix_len
+
+    def _collect_evictable_leaves(self) -> list[RadixTreeNode]:
+        stack = [self._root]
+        leaves: list[RadixTreeNode] = []
+        while stack:
+            n = stack.pop()
+            if n.is_leaf():
+                if n.ref_count == 0 and not n.is_root():
+                    leaves.append(n)
+            else:
+                stack.extend(n.children.values())
+        return leaves
