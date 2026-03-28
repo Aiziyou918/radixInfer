@@ -86,6 +86,18 @@ class AppState:
         self.request_counter += 1
         return current
 
+    async def collect_response(self, request_id: int, output_queue: asyncio.Queue[StreamChunk]) -> tuple[str, str]:
+        parts: list[str] = []
+        finish_reason = "stop"
+        while True:
+            chunk = await output_queue.get()
+            if chunk.text:
+                parts.append(chunk.text)
+            if chunk.finished:
+                finish_reason = chunk.finish_reason
+                break
+        return "".join(parts), finish_reason
+
     async def shutdown(self) -> None:
         self.tokenizer_ingress.put(None)
         self.runtime_ingress.put(None)
@@ -102,6 +114,35 @@ def _flatten_prompt(request: ChatCompletionRequest) -> str:
     if request.messages:
         return "\n".join(f"{msg.role}: {msg.content}" for msg in request.messages)
     return request.prompt or ""
+
+
+def _build_stream_payload(request_id: int, delta: dict, finish_reason: str | None) -> dict:
+    return {
+        "id": f"chatcmpl-{request_id}",
+        "object": "chat.completion.chunk",
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+
+
+def _build_completion_payload(request_id: int, model: str, content: str, finish_reason: str) -> dict:
+    return {
+        "id": f"chatcmpl-{request_id}",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
 
 
 def create_app(config: ServerConfig) -> FastAPI:
@@ -123,7 +164,7 @@ def create_app(config: ServerConfig) -> FastAPI:
         return {"object": "list", "data": [{"id": config.model, "object": "model"}]}
 
     @app.post("/v1/chat/completions")
-    async def completions(payload: ChatCompletionRequest, request: Request) -> StreamingResponse:
+    async def completions(payload: ChatCompletionRequest, request: Request):
         request_id = state.next_request_id()
         output_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
         state.listeners[request_id] = output_queue
@@ -141,6 +182,13 @@ def create_app(config: ServerConfig) -> FastAPI:
             )
         )
 
+        if not payload.stream:
+            try:
+                content, finish_reason = await state.collect_response(request_id, output_queue)
+                return _build_completion_payload(request_id, config.model, content, finish_reason)
+            finally:
+                state.listeners.pop(request_id, None)
+
         async def stream():
             first = True
             try:
@@ -155,17 +203,11 @@ def create_app(config: ServerConfig) -> FastAPI:
                         first = False
                     if chunk.text:
                         delta["content"] = chunk.text
-                    body = {
-                        "id": f"chatcmpl-{request_id}",
-                        "object": "chat.completion.chunk",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": delta,
-                                "finish_reason": None if not chunk.finished else chunk.finish_reason,
-                            }
-                        ],
-                    }
+                    body = _build_stream_payload(
+                        request_id,
+                        delta,
+                        None if not chunk.finished else chunk.finish_reason,
+                    )
                     yield f"data: {json.dumps(body)}\n\n"
                     if chunk.finished:
                         break

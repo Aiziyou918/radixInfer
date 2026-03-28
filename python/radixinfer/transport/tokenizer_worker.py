@@ -87,7 +87,7 @@ class TokenizerProcess:
                         request_id=message.request_id,
                         text=tokenizer.decode_token(message.token_id),
                         finished=message.finished,
-                        finish_reason="stop" if message.finished else "running",
+                        finish_reason=message.finish_reason,
                     )
                 )
 

@@ -68,6 +68,7 @@ class SchedulerRuntime:
                             request_id=item.request_id,
                             token_id=0,
                             finished=True,
+                            finish_reason="abort",
                         )
                     )
         return stop
@@ -84,17 +85,32 @@ class SchedulerRuntime:
         self._age_waiting(reset_selected=set(plan.prefill + plan.decode))
 
     def _run_prefill(self, request_ids: list[int]) -> None:
+        remaining_budget = self.config.max_prefill_tokens
         for request_id in request_ids:
             request = self.requests[request_id]
-            if request.phase != RequestPhase.WAIT_PREFILL:
+            if request.finished or request.prefill_complete:
                 continue
-            extend_tokens = max(1, len(request.prompt_tokens) - request.prefix_matched)
-            reservation = self.page_pool.reserve_for_tokens(extend_tokens + request.sampling.max_tokens)
-            if reservation is None:
-                continue
-            request.reservation = reservation
-            request.phase = RequestPhase.READY_TO_DECODE
-            self.prefix_store.insert(request.prompt_tokens)
+            if request.reservation is None:
+                total_reserved = request.uncached_prompt_tokens + request.sampling.max_tokens
+                reservation = self.page_pool.reserve_for_tokens(total_reserved)
+                if reservation is None:
+                    continue
+                request.reservation = reservation
+                request.reserved_tokens = total_reserved
+
+            chunk_tokens = min(request.remaining_prefill_tokens, remaining_budget)
+            if chunk_tokens <= 0:
+                break
+
+            request.phase = RequestPhase.PREFILLING
+            request.prefill_cursor += chunk_tokens
+            remaining_budget -= chunk_tokens
+
+            if request.prefill_complete:
+                request.phase = RequestPhase.READY_TO_DECODE
+                self.prefix_store.insert(request.prompt_tokens)
+            if remaining_budget <= 0:
+                break
 
     def _run_decode(self, request_ids: list[int]) -> None:
         selected = [
@@ -115,7 +131,14 @@ class SchedulerRuntime:
         )
         for request, token_id in zip(selected, output.next_token_ids, strict=True):
             request.generated_tokens.append(token_id)
-            finished = request.remaining_tokens <= 0 or token_id in self.config.stop_token_ids
+            finished = False
+            finish_reason = "running"
+            if token_id in self.config.stop_token_ids:
+                finished = True
+                finish_reason = "stop"
+            elif request.remaining_tokens <= 0:
+                finished = True
+                finish_reason = "length"
             if finished:
                 request.phase = RequestPhase.FINISHED
                 if request.reservation is not None:
@@ -126,6 +149,7 @@ class SchedulerRuntime:
                     request_id=request.request_id,
                     token_id=token_id,
                     finished=finished,
+                    finish_reason=finish_reason,
                 )
             )
 

@@ -28,13 +28,17 @@ class BatchPlanner:
         if remaining_slots <= 0:
             return Plan(prefill=[], decode=decode_ids)
 
-        waiting = [req for req in active if req.phase == RequestPhase.WAIT_PREFILL]
+        waiting = [
+            req
+            for req in active
+            if req.phase in {RequestPhase.WAIT_PREFILL, RequestPhase.PREFILLING}
+        ]
         waiting.sort(key=lambda req: (-req.age, req.request_id))
 
         prefill_ids: list[int] = []
         token_budget = self.max_prefill_tokens
         for req in waiting:
-            cost = max(1, len(req.prompt_tokens) - req.prefix_matched)
+            cost = max(1, req.remaining_prefill_tokens)
             if cost > token_budget and prefill_ids:
                 break
             prefill_ids.append(req.request_id)

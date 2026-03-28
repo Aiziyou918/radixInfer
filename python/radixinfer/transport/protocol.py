@@ -37,6 +37,7 @@ class DetokenizeRequest:
     request_id: int
     token_id: int
     finished: bool = False
+    finish_reason: Literal["stop", "abort", "length", "error", "running"] = "running"
 
 
 @dataclass(frozen=True)
