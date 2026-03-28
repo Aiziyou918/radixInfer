@@ -63,16 +63,24 @@ def test_real_multiprocess_server_path() -> None:
             body = nonstream.json()
             assert body["object"] == "chat.completion"
             assert body["choices"][0]["finish_reason"] in {"stop", "length"}
+            assert body["usage"]["completion_tokens"] == 3
 
             with client.stream(
                 "POST",
                 f"http://127.0.0.1:{port}/v1/chat/completions",
-                json={"model": "debug", "prompt": "hi", "max_tokens": 3, "stream": True},
+                json={
+                    "model": "debug",
+                    "prompt": "hi",
+                    "max_tokens": 3,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                },
             ) as stream:
                 assert stream.status_code == 200
                 lines = [line for line in stream.iter_lines() if line]
             joined = "\n".join(lines)
             assert "chat.completion.chunk" in joined
+            assert '"usage"' in joined
             assert "[DONE]" in joined
     finally:
         proc.terminate()

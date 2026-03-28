@@ -2,10 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import torch
+
 
 @dataclass(frozen=True)
 class PageSpan:
     page_ids: tuple[int, ...]
+    token_count: int
+
+
+@dataclass(frozen=True)
+class KVCacheView:
+    keys: torch.Tensor
+    values: torch.Tensor
     token_count: int
 
 
@@ -24,12 +33,20 @@ class PageReservation:
 class PagePool:
     total_pages: int
     page_size: int
+    kv_cache_dim: int = 16
     _free_pages: list[int] = field(init=False)
     _page_data: dict[int, list[int]] = field(init=False)
+    _key_cache: torch.Tensor = field(init=False)
+    _value_cache: torch.Tensor = field(init=False)
 
     def __post_init__(self) -> None:
         self._free_pages = list(range(self.total_pages))
         self._page_data = {page_id: [] for page_id in range(self.total_pages)}
+        self._key_cache = torch.zeros(
+            (self.total_pages, self.page_size, self.kv_cache_dim),
+            dtype=torch.float32,
+        )
+        self._value_cache = torch.zeros_like(self._key_cache)
 
     @property
     def free_pages(self) -> int:
@@ -72,6 +89,7 @@ class PagePool:
                     page_tokens[idx] = token
                 else:
                     page_tokens.append(token)
+                self._write_kv(page_id, idx, token)
             page_index += 1
             in_page_offset = 0
 
@@ -85,8 +103,27 @@ class PagePool:
             tokens.extend(self._page_data[page_id])
         return tokens[: span.token_count]
 
+    def read_kv(self, span: PageSpan) -> KVCacheView:
+        used_pages = len(span.page_ids)
+        keys = self._key_cache[list(span.page_ids)].reshape(used_pages * self.page_size, self.kv_cache_dim)
+        values = self._value_cache[list(span.page_ids)].reshape(
+            used_pages * self.page_size, self.kv_cache_dim
+        )
+        return KVCacheView(
+            keys=keys[: span.token_count].clone(),
+            values=values[: span.token_count].clone(),
+            token_count=span.token_count,
+        )
+
     def release(self, reservation: PageReservation) -> None:
         for page_id in reservation.page_ids:
             self._page_data[page_id] = []
+            self._key_cache[page_id].zero_()
+            self._value_cache[page_id].zero_()
         self._free_pages.extend(reservation.page_ids)
         self._free_pages.sort()
+
+    def _write_kv(self, page_id: int, slot: int, token: int) -> None:
+        base = torch.arange(self.kv_cache_dim, dtype=torch.float32)
+        self._key_cache[page_id, slot] = base + float(token)
+        self._value_cache[page_id, slot] = base * 0.5 + float(token)

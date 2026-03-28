@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import multiprocessing as mp
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from queue import Empty, Queue
@@ -37,6 +38,10 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class StreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
     prompt: str | None = None
@@ -47,6 +52,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = 1.0
     stream: bool = True
     ignore_eos: bool = False
+    stream_options: StreamOptions | None = None
 
 
 @dataclass
@@ -169,9 +175,12 @@ class AppState:
                 continue
             chunk = StreamChunk(
                 request_id=detok.request_id,
-                text=self.inline_tokenizer.decode_token(detok.token_id),
+                token_id=detok.token_id,
+                text=self.inline_tokenizer.decode_token(detok.token_id) if detok.emit_text else "",
                 finished=detok.finished,
                 finish_reason=detok.finish_reason,
+                prompt_tokens=detok.prompt_tokens,
+                completion_tokens=detok.completion_tokens,
             )
             listener = self.listeners.get(chunk.request_id)
             if listener is not None:
@@ -180,17 +189,23 @@ class AppState:
                 completed[chunk.request_id] = True
         return completed
 
-    async def collect_response(self, request_id: int, output_queue: asyncio.Queue[StreamChunk]) -> tuple[str, str]:
+    async def collect_response(
+        self,
+        request_id: int,
+        output_queue: asyncio.Queue[StreamChunk],
+    ) -> tuple[str, str, dict[str, int]]:
         parts: list[str] = []
         finish_reason = "stop"
+        usage = _build_usage(0, 0)
         while True:
             chunk = await output_queue.get()
             if chunk.text:
                 parts.append(chunk.text)
             if chunk.finished:
                 finish_reason = chunk.finish_reason
+                usage = _build_usage(chunk.prompt_tokens or 0, chunk.completion_tokens or 0)
                 break
-        return "".join(parts), finish_reason
+        return "".join(parts), finish_reason, usage
 
     async def shutdown(self) -> None:
         if self.inline_tasks:
@@ -214,10 +229,27 @@ def _flatten_prompt(request: ChatCompletionRequest) -> str:
     return request.prompt or ""
 
 
-def _build_stream_payload(request_id: int, delta: dict, finish_reason: str | None) -> dict:
+def _build_usage(prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+def _build_stream_payload(
+    request_id: int,
+    model: str,
+    created: int,
+    delta: dict,
+    finish_reason: str | None,
+    usage: dict[str, int] | None = None,
+) -> dict:
     return {
         "id": f"chatcmpl-{request_id}",
         "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
         "choices": [
             {
                 "index": 0,
@@ -225,13 +257,22 @@ def _build_stream_payload(request_id: int, delta: dict, finish_reason: str | Non
                 "finish_reason": finish_reason,
             }
         ],
+        **({"usage": usage} if usage is not None else {}),
     }
 
 
-def _build_completion_payload(request_id: int, model: str, content: str, finish_reason: str) -> dict:
+def _build_completion_payload(
+    request_id: int,
+    model: str,
+    created: int,
+    content: str,
+    finish_reason: str,
+    usage: dict[str, int],
+) -> dict:
     return {
         "id": f"chatcmpl-{request_id}",
         "object": "chat.completion",
+        "created": created,
         "model": model,
         "choices": [
             {
@@ -240,6 +281,7 @@ def _build_completion_payload(request_id: int, model: str, content: str, finish_
                 "finish_reason": finish_reason,
             }
         ],
+        "usage": usage,
     }
 
 
@@ -272,6 +314,7 @@ def create_app(config: ServerConfig) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def completions(payload: ChatCompletionRequest, request: Request):
         request_id = state.next_request_id()
+        created = int(time.time())
         output_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
         state.listeners[request_id] = output_queue
         state.submit_request(
@@ -288,8 +331,15 @@ def create_app(config: ServerConfig) -> FastAPI:
 
         if not payload.stream:
             try:
-                content, finish_reason = await state.collect_response(request_id, output_queue)
-                return _build_completion_payload(request_id, config.model, content, finish_reason)
+                content, finish_reason, usage = await state.collect_response(request_id, output_queue)
+                return _build_completion_payload(
+                    request_id,
+                    config.model,
+                    created,
+                    content,
+                    finish_reason,
+                    usage,
+                )
             finally:
                 state.listeners.pop(request_id, None)
 
@@ -309,8 +359,15 @@ def create_app(config: ServerConfig) -> FastAPI:
                         delta["content"] = chunk.text
                     body = _build_stream_payload(
                         request_id,
+                        config.model,
+                        created,
                         delta,
                         None if not chunk.finished else chunk.finish_reason,
+                        usage=(
+                            _build_usage(chunk.prompt_tokens or 0, chunk.completion_tokens or 0)
+                            if chunk.finished and payload.stream_options and payload.stream_options.include_usage
+                            else None
+                        ),
                     )
                     yield f"data: {json.dumps(body)}\n\n"
                     if chunk.finished:

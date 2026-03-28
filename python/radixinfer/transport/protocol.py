@@ -40,14 +40,20 @@ class DetokenizeRequest:
     token_id: int
     finished: bool = False
     finish_reason: Literal["stop", "abort", "length", "error", "running"] = "running"
+    emit_text: bool = True
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
 
 
 @dataclass(frozen=True)
 class StreamChunk:
     request_id: int
+    token_id: int
     text: str
     finished: bool
     finish_reason: Literal["stop", "abort", "length", "error", "running"] = "running"
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
 
 
 @dataclass(frozen=True)

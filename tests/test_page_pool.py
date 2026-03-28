@@ -18,3 +18,14 @@ def test_page_pool_can_write_and_read_tokens() -> None:
     span = pool.write_tokens(reservation, [1, 2, 3, 4, 5, 6])
     assert span.token_count == 6
     assert pool.read_span(span) == [1, 2, 3, 4, 5, 6]
+
+
+def test_page_pool_exposes_kv_view() -> None:
+    pool = PagePool(total_pages=4, page_size=4, kv_cache_dim=8)
+    reservation = pool.reserve_for_tokens(3)
+    assert reservation is not None
+    span = pool.write_tokens(reservation, [10, 20, 30])
+    kv = pool.read_kv(span)
+    assert kv.token_count == 3
+    assert tuple(kv.keys.shape) == (3, 8)
+    assert tuple(kv.values.shape) == (3, 8)

@@ -64,6 +64,9 @@ def test_decode_reports_length_finish_reason() -> None:
     message = runtime.tokenizer_queue.get(timeout=1.0)
     assert message.finished is True
     assert message.finish_reason == "length"
+    assert message.emit_text is True
+    assert message.prompt_tokens == 2
+    assert message.completion_tokens == 1
 
 
 def test_decode_respects_request_eos_token() -> None:
@@ -90,6 +93,7 @@ def test_decode_respects_request_eos_token() -> None:
     message = runtime.tokenizer_queue.get(timeout=1.0)
     assert message.finished is True
     assert message.finish_reason == "stop"
+    assert message.emit_text is False
 
 
 def test_decode_can_ignore_eos_when_requested() -> None:
@@ -116,3 +120,4 @@ def test_decode_can_ignore_eos_when_requested() -> None:
     message = runtime.tokenizer_queue.get(timeout=1.0)
     assert message.finished is False
     assert message.finish_reason == "running"
+    assert message.emit_text is True

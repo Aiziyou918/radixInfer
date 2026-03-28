@@ -56,9 +56,14 @@ def test_nonstream_completion_inline_mode() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["object"] == "chat.completion"
+    assert payload["model"] == "debug"
+    assert isinstance(payload["created"], int)
     assert payload["choices"][0]["message"]["role"] == "assistant"
     assert isinstance(payload["choices"][0]["message"]["content"], str)
     assert payload["choices"][0]["finish_reason"] in {"stop", "length"}
+    assert payload["usage"]["prompt_tokens"] >= 1
+    assert payload["usage"]["completion_tokens"] == 3
+    assert payload["usage"]["total_tokens"] == payload["usage"]["prompt_tokens"] + 3
 
 
 def test_stream_completion_inline_mode() -> None:
@@ -72,3 +77,23 @@ def test_stream_completion_inline_mode() -> None:
     body = "\n".join(lines)
     assert "chat.completion.chunk" in body
     assert "[DONE]" in body
+
+
+def test_stream_completion_can_include_usage_on_final_chunk() -> None:
+    response, lines = asyncio.run(
+        _request_stream(
+            "/v1/chat/completions",
+            {
+                "model": "debug",
+                "prompt": "hi",
+                "max_tokens": 3,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+    )
+    assert response.status_code == 200
+    payloads = [line.removeprefix("data: ") for line in lines if line.startswith("data: {")]
+    final = payloads[-1]
+    assert '"usage"' in final
+    assert '"completion_tokens": 3' in final

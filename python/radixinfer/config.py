@@ -15,6 +15,7 @@ class ServerConfig:
     max_prefill_tokens: int = 2048
     page_size: int = 16
     total_pages: int = 4096
+    kv_cache_dim: int = 16
     max_batch_size: int = 32
     engine_kind: Literal["dummy", "hf"] = "hf"
     prefix_cache_capacity: int = 4096

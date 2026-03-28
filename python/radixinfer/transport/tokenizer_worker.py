@@ -105,12 +105,16 @@ class TokenizerProcess:
                     )
                 )
             elif isinstance(message, DetokenizeRequest):
+                text = tokenizer.decode_token(message.token_id) if message.emit_text else ""
                 self.frontend_queue.put(
                     StreamChunk(
                         request_id=message.request_id,
-                        text=tokenizer.decode_token(message.token_id),
+                        token_id=message.token_id,
+                        text=text,
                         finished=message.finished,
                         finish_reason=message.finish_reason,
+                        prompt_tokens=message.prompt_tokens,
+                        completion_tokens=message.completion_tokens,
                     )
                 )
 

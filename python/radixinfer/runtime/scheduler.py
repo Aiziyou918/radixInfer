@@ -20,7 +20,11 @@ class SchedulerRuntime:
         self.ingress = ingress
         self.tokenizer_queue = tokenizer_queue
         self.requests: dict[int, RuntimeRequest] = {}
-        self.page_pool = PagePool(total_pages=config.total_pages, page_size=config.page_size)
+        self.page_pool = PagePool(
+            total_pages=config.total_pages,
+            page_size=config.page_size,
+            kv_cache_dim=config.kv_cache_dim,
+        )
         self.prefix_store = PrefixStore(
             capacity=config.prefix_cache_capacity,
             page_size=config.page_size,
@@ -73,6 +77,9 @@ class SchedulerRuntime:
                             token_id=0,
                             finished=True,
                             finish_reason="abort",
+                            emit_text=False,
+                            prompt_tokens=len(request.prompt_tokens),
+                            completion_tokens=len(request.generated_tokens),
                         )
                     )
         return stop
@@ -148,6 +155,7 @@ class SchedulerRuntime:
             DecodeInput(
                 request_ids=[req.request_id for req in selected],
                 token_ids=[self.page_pool.read_span(req.cache_span) for req in selected],  # type: ignore[arg-type]
+                kv_caches=[self.page_pool.read_kv(req.cache_span) for req in selected],  # type: ignore[arg-type]
             )
         )
         for request, token_id in zip(selected, output.next_token_ids, strict=True):
@@ -161,6 +169,7 @@ class SchedulerRuntime:
             )
             finished = False
             finish_reason = "running"
+            emit_text = True
             request_stop_tokens = set(self.config.stop_token_ids).union(request.stop_token_ids)
             if (
                 not request.sampling.ignore_eos
@@ -169,9 +178,11 @@ class SchedulerRuntime:
             ):
                 finished = True
                 finish_reason = "stop"
+                emit_text = False
             elif token_id in request_stop_tokens:
                 finished = True
                 finish_reason = "stop"
+                emit_text = False
             elif request.remaining_tokens <= 0:
                 finished = True
                 finish_reason = "length"
@@ -186,6 +197,9 @@ class SchedulerRuntime:
                     token_id=token_id,
                     finished=finished,
                     finish_reason=finish_reason,
+                    emit_text=emit_text,
+                    prompt_tokens=len(request.prompt_tokens),
+                    completion_tokens=len(request.generated_tokens),
                 )
             )
 

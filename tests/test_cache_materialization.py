@@ -115,3 +115,37 @@ def test_decode_appends_token_into_page_backed_cache() -> None:
     runtime._run_decode([1])
     assert req.cache_span is not None
     assert runtime.page_pool.read_span(req.cache_span) == [7, 8, 9, 10, 99]
+
+
+def test_decode_input_carries_kv_cache_view() -> None:
+    runtime = SchedulerRuntime(
+        ServerConfig(
+            model="debug",
+            engine_kind="dummy",
+            max_prefill_tokens=8,
+            max_batch_size=2,
+            page_size=2,
+            total_pages=16,
+            kv_cache_dim=8,
+        ),
+        Queue(),
+        Queue(),
+    )
+    req = RuntimeRequest(
+        request_id=3,
+        prompt_tokens=[7, 8, 9, 10],
+        sampling=SamplingParams(max_tokens=2),
+    )
+    runtime.requests[3] = req
+    runtime._run_prefill([3])
+    seen = {}
+
+    def fake_decode(batch):
+        seen["token_ids"] = batch.token_ids
+        seen["kv_shapes"] = [(tuple(view.keys.shape), tuple(view.values.shape)) for view in batch.kv_caches]
+        return type("Out", (), {"next_token_ids": [77]})()
+
+    runtime.engine.decode = fake_decode  # type: ignore[method-assign]
+    runtime._run_decode([3])
+    assert seen["token_ids"] == [[7, 8, 9, 10]]
+    assert seen["kv_shapes"] == [((4, 8), (4, 8))]
