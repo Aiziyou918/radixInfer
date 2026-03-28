@@ -110,4 +110,15 @@ def init_pynccl(
         )
 
 
-__all__ = ["store_cache", "indexing", "fast_compare_key", "init_pynccl"]
+def fused_moe_kernel_triton(*args, **kwargs):
+    from radixinfer.kernel.moe_impl import fused_moe_kernel_triton as _impl
+    return _impl(*args, **kwargs)
+
+
+def moe_sum_reduce_triton(*args, **kwargs):
+    from radixinfer.kernel.moe_impl import moe_sum_reduce_triton as _impl
+    return _impl(*args, **kwargs)
+
+
+__all__ = ["store_cache", "indexing", "fast_compare_key", "init_pynccl",
+           "fused_moe_kernel_triton", "moe_sum_reduce_triton"]

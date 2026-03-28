@@ -52,7 +52,15 @@ class GatedMLP(BaseOP):
 
 class MoEMLP(BaseOP):
     def __init__(self, config: ModelConfig):
-        self.experts = MoELayer(layer_id=0)
+        self.experts = MoELayer(
+            num_experts=config.num_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            renormalize=config.norm_topk_prob,
+            activation=config.hidden_act,
+            apply_router_weight_on_input=False,
+        )
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self._config = config
 

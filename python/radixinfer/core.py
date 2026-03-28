@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from radixinfer.engine.attention import BaseAttnBackend, BaseAttnMetadata
     from radixinfer.cache.kv_pool import BaseKVCachePool
     from radixinfer.distributed import DistributedCommunicator
+    from radixinfer.moe import BaseMoeBackend
 
 
 @dataclass
@@ -109,6 +110,7 @@ class Context:
     page_table: torch.Tensor = field(init=False)
     attn_backend: BaseAttnBackend = field(init=False)
     kv_cache: BaseKVCachePool = field(init=False)
+    moe_backend: BaseMoeBackend | None = field(default=None, init=False)
     _batch: Batch | None = field(default=None, init=False)
 
     @property
