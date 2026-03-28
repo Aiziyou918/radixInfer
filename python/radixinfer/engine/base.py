@@ -7,6 +7,15 @@ from radixinfer.cache.page_pool import KVCacheView
 
 
 @dataclass(frozen=True)
+class MaterializedBatchMetadata:
+    positions: list[int] = field(default_factory=list)
+    input_table_slots: list[int] = field(default_factory=list)
+    input_positions: list[int] = field(default_factory=list)
+    write_table_slots: list[int] = field(default_factory=list)
+    write_positions: list[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class AttentionCacheWrite:
     keys: object
     values: object
@@ -17,7 +26,8 @@ class AttentionCacheWrite:
 class PrefillInput:
     request_ids: list[int]
     token_ids: list[list[int]]
-    kv_caches: list[KVCacheView] = field(default_factory=list)
+    kv_caches: list[KVCacheView | None] = field(default_factory=list)
+    metadata: MaterializedBatchMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -29,7 +39,8 @@ class PrefillOutput:
 class DecodeInput:
     request_ids: list[int]
     token_ids: list[list[int]]
-    kv_caches: list[KVCacheView] = field(default_factory=list)
+    kv_caches: list[KVCacheView | None] = field(default_factory=list)
+    metadata: MaterializedBatchMetadata | None = None
 
 
 @dataclass(frozen=True)

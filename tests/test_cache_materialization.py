@@ -193,6 +193,39 @@ def test_executor_prepares_decode_metadata() -> None:
     assert prepared.metadata.write_positions == [4]
 
 
+def test_executor_prepares_prefill_metadata() -> None:
+    runtime = SchedulerRuntime(
+        ServerConfig(
+            model="debug",
+            engine_kind="dummy",
+            max_prefill_tokens=8,
+            max_batch_size=2,
+            page_size=2,
+            total_pages=16,
+        ),
+        Queue(),
+        Queue(),
+    )
+    req = RuntimeRequest(
+        request_id=9,
+        prompt_tokens=[31, 32, 33, 34],
+        sampling=SamplingParams(max_tokens=2),
+        prefix_matched=2,
+        prefill_cursor=2,
+    )
+    req.table_slot = runtime.table_manager.allocate()
+    req.reservation = runtime.cache_manager.reserve(6, None)
+    assert req.reservation is not None
+    req.cache_span = runtime.page_pool.write_tokens(req.reservation, [31, 32, 33, 34])
+    prepared = runtime.executor.prepare_prefill_batch([req])
+    assert prepared.prefill_input.token_ids == [[33, 34]]
+    assert prepared.metadata.positions == [2, 3]
+    assert prepared.metadata.input_table_slots == [req.table_slot]
+    assert prepared.metadata.input_positions == [2, 3]
+    assert prepared.metadata.write_table_slots == [req.table_slot]
+    assert prepared.metadata.write_positions == [2, 3]
+
+
 def test_prefill_writes_real_kv_into_page_pool_for_hf_debug_engine() -> None:
     runtime = SchedulerRuntime(
         ServerConfig(

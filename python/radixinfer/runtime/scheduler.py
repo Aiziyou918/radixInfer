@@ -7,7 +7,6 @@ from queue import Empty
 from radixinfer.cache.page_pool import PagePool
 from radixinfer.cache.prefix_store import PrefixStore
 from radixinfer.config import ServerConfig
-from radixinfer.engine.base import PrefillInput
 from radixinfer.engine import build_engine
 from radixinfer.runtime.cache_manager import CacheManager
 from radixinfer.runtime.executor import Executor
@@ -167,18 +166,9 @@ class SchedulerRuntime:
                     prefix_tokens[request.prefix_matched :],
                     start_offset=request.prefix_matched,
                 )
-                kv_prefix = (
-                    self.page_pool.read_kv(request.cache_span, token_count=request.prefix_matched)
-                    if request.cache_span is not None and request.prefix_matched > 0
-                    else None
-                )
-                prefill_output = self.engine.prefill(
-                    PrefillInput(
-                        request_ids=[request.request_id],
-                        token_ids=[prefix_tokens[request.prefix_matched :]],
-                        kv_caches=[kv_prefix] if kv_prefix is not None else [],
-                    )
-                )
+                request.cache_span = cache_span
+                prepared = self.executor.prepare_prefill_batch([request])
+                prefill_output = self.engine.prefill(prepared.prefill_input)
                 if prefill_output.kv_writes:
                     kv_write = prefill_output.kv_writes[0]
                     cache_span = self.page_pool.write_kv(

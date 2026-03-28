@@ -64,31 +64,35 @@ class HuggingFaceEngine:
 
     @torch.inference_mode()
     def prefill(self, batch: PrefillInput) -> PrefillOutput:
-        kv_writes = []
-        kv_caches = batch.kv_caches or [None] * len(batch.request_ids)
-        for token_ids, kv_cache in zip(batch.token_ids, kv_caches, strict=True):
-            inputs = self.attention.prepare_inputs(token_ids, kv_cache)
-            outputs = self.model(
+        prepared = self.attention.prepare_batch(batch.token_ids, batch.kv_caches, batch.metadata)
+        outputs = [
+            self.model(
                 input_ids=inputs.input_ids,
                 past_key_values=inputs.past_key_values,
                 use_cache=True,
             )
-            kv_writes.append(self.attention.extract_cache_write(outputs, len(token_ids)))
+            for inputs in prepared
+        ]
+        kv_writes = self.attention.extract_cache_writes(
+            outputs,
+            [len(token_ids) for token_ids in batch.token_ids],
+        )
         return PrefillOutput(kv_writes=kv_writes)
 
     @torch.inference_mode()
     def decode(self, batch: DecodeInput) -> DecodeOutput:
-        next_token_ids = []
-        kv_writes = []
-        kv_caches = batch.kv_caches or [None] * len(batch.request_ids)
-        for token_ids, kv_cache in zip(batch.token_ids, kv_caches, strict=True):
-            inputs = self.attention.prepare_inputs(token_ids, kv_cache)
-            outputs = self.model(
+        prepared = self.attention.prepare_batch(batch.token_ids, batch.kv_caches, batch.metadata)
+        outputs = [
+            self.model(
                 input_ids=inputs.input_ids,
                 past_key_values=inputs.past_key_values,
                 use_cache=True,
             )
-            logits = outputs.logits[:, -1, :]
-            next_token_ids.append(int(logits.argmax(dim=-1).item()))
-            kv_writes.append(self.attention.extract_cache_write(outputs, len(token_ids)))
+            for inputs in prepared
+        ]
+        next_token_ids = [int(output.logits[:, -1, :].argmax(dim=-1).item()) for output in outputs]
+        kv_writes = self.attention.extract_cache_writes(
+            outputs,
+            [len(token_ids) for token_ids in batch.token_ids],
+        )
         return DecodeOutput(next_token_ids=next_token_ids, kv_writes=kv_writes)

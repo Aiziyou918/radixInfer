@@ -8,20 +8,30 @@ from transformers.cache_utils import DynamicCache
 
 from radixinfer.cache.page_pool import KVCacheView
 
-from .base import AttentionCacheWrite
+from .base import AttentionCacheWrite, MaterializedBatchMetadata
 
 
 @dataclass(frozen=True)
 class AttentionInputs:
     input_ids: torch.Tensor
     past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None
+    metadata: MaterializedBatchMetadata | None = None
 
 
 class AttentionBackend:
-    def prepare_inputs(self, token_ids: list[int], kv_cache: KVCacheView | None) -> AttentionInputs:
+    def prepare_batch(
+        self,
+        token_ids: list[list[int]],
+        kv_caches: list[KVCacheView | None] | None = None,
+        metadata: MaterializedBatchMetadata | None = None,
+    ) -> list[AttentionInputs]:
         raise NotImplementedError
 
-    def extract_cache_write(self, model_output: Any, input_length: int) -> AttentionCacheWrite:
+    def extract_cache_writes(
+        self,
+        model_outputs: list[Any],
+        input_lengths: list[int],
+    ) -> list[AttentionCacheWrite]:
         raise NotImplementedError
 
 
@@ -33,31 +43,75 @@ class HuggingFaceAttentionBackend(AttentionBackend):
     device: str
     dtype: torch.dtype
 
-    def prepare_inputs(self, token_ids: list[int], kv_cache: KVCacheView | None) -> AttentionInputs:
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
-        if kv_cache is None or kv_cache.token_count == 0:
-            return AttentionInputs(input_ids=input_ids, past_key_values=None)
-        legacy_cache = self._to_past_key_values(kv_cache)
-        return AttentionInputs(
-            input_ids=input_ids,
-            past_key_values=DynamicCache.from_legacy_cache(legacy_cache),
-        )
+    def prepare_batch(
+        self,
+        token_ids: list[list[int]],
+        kv_caches: list[KVCacheView | None] | None = None,
+        metadata: MaterializedBatchMetadata | None = None,
+    ) -> list[AttentionInputs]:
+        prepared: list[AttentionInputs] = []
+        kv_caches = kv_caches or [None] * len(token_ids)
+        for index, (request_tokens, kv_cache) in enumerate(zip(token_ids, kv_caches, strict=True)):
+            input_ids = torch.tensor([request_tokens], dtype=torch.long, device=self.device)
+            request_metadata = None
+            if metadata is not None:
+                request_metadata = MaterializedBatchMetadata(
+                    positions=[metadata.positions[index]] if index < len(metadata.positions) else [],
+                    input_table_slots=(
+                        [metadata.input_table_slots[index]] if index < len(metadata.input_table_slots) else []
+                    ),
+                    input_positions=(
+                        [metadata.input_positions[index]] if index < len(metadata.input_positions) else []
+                    ),
+                    write_table_slots=(
+                        [metadata.write_table_slots[index]] if index < len(metadata.write_table_slots) else []
+                    ),
+                    write_positions=(
+                        [metadata.write_positions[index]] if index < len(metadata.write_positions) else []
+                    ),
+                )
+            if kv_cache is None or kv_cache.token_count == 0:
+                prepared.append(
+                    AttentionInputs(input_ids=input_ids, past_key_values=None, metadata=request_metadata)
+                )
+                continue
+            legacy_cache = self._to_past_key_values(kv_cache)
+            prepared.append(
+                AttentionInputs(
+                    input_ids=input_ids,
+                    past_key_values=DynamicCache.from_legacy_cache(legacy_cache),
+                    metadata=request_metadata,
+                )
+            )
+        return prepared
 
-    def extract_cache_write(self, model_output: Any, input_length: int) -> AttentionCacheWrite:
-        if not getattr(model_output, "past_key_values", None):
-            return AttentionCacheWrite(keys=torch.empty(0), values=torch.empty(0), token_count=0)
-        layer_keys: list[torch.Tensor] = []
-        layer_values: list[torch.Tensor] = []
-        for layer_key, layer_value in model_output.past_key_values:
-            key_delta = layer_key[:, :, -input_length:, :].permute(0, 2, 1, 3).squeeze(0)
-            value_delta = layer_value[:, :, -input_length:, :].permute(0, 2, 1, 3).squeeze(0)
-            layer_keys.append(key_delta.to(dtype=torch.float32, device="cpu"))
-            layer_values.append(value_delta.to(dtype=torch.float32, device="cpu"))
-        return AttentionCacheWrite(
-            keys=torch.stack(layer_keys, dim=0),
-            values=torch.stack(layer_values, dim=0),
-            token_count=input_length,
-        )
+    def extract_cache_writes(
+        self,
+        model_outputs: list[Any],
+        input_lengths: list[int],
+    ) -> list[AttentionCacheWrite]:
+        writes: list[AttentionCacheWrite] = []
+        for model_output, input_length in zip(model_outputs, input_lengths, strict=True):
+            if not getattr(model_output, "past_key_values", None):
+                writes.append(
+                    AttentionCacheWrite(keys=torch.empty(0), values=torch.empty(0), token_count=0)
+                )
+                continue
+            layer_keys: list[torch.Tensor] = []
+            layer_values: list[torch.Tensor] = []
+            for layer_key, layer_value in model_output.past_key_values:
+                key_delta = layer_key[:, :, -input_length:, :].permute(0, 2, 1, 3).squeeze(0)
+                value_delta = layer_value[:, :, -input_length:, :].permute(0, 2, 1, 3).squeeze(0)
+                layer_keys.append(key_delta.to(dtype=torch.float32, device="cpu"))
+                layer_values.append(value_delta.to(dtype=torch.float32, device="cpu"))
+            writes.append(
+                AttentionCacheWrite(
+                    keys=torch.stack(layer_keys, dim=0),
+                    values=torch.stack(layer_values, dim=0),
+                    token_count=input_length,
+                )
+            )
+        return writes
 
     def _to_past_key_values(
         self,
