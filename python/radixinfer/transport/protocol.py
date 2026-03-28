@@ -22,6 +22,9 @@ class TokenizeRequest:
     request_id: int
     prompt: str
     sampling: SamplingParams
+    # Optional list of chat messages; when set the tokenizer applies the chat
+    # template instead of encoding `prompt` directly.
+    messages: list | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,12 @@ class StreamChunk:
     finish_reason: Literal["stop", "abort", "length", "error", "running"] = "running"
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class BatchDetokenizeRequest:
+    """Wraps multiple DetokenizeRequests for efficient batch transport over ZMQ."""
+    requests: list
 
 
 @dataclass(frozen=True)

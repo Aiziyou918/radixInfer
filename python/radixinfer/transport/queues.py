@@ -55,3 +55,17 @@ def make_zmq_pair(addr: str):
     push = make_zmq_push(addr, create=True)
     pull = make_zmq_pull(addr, create=False)
     return push, pull
+
+
+def make_zmq_pub(addr: str, *, create: bool = True, encoder=None):
+    """Return a PUB socket bound/connected to *addr* (for multi-rank broadcast)."""
+    from radixinfer.utils.mp import ZmqPubQueue, pickle_encode
+
+    return ZmqPubQueue(addr, create=create, encoder=encoder or pickle_encode)
+
+
+def make_zmq_sub(addr: str, *, create: bool = False, decoder=None):
+    """Return a SUB socket connected to *addr* (for multi-rank broadcast)."""
+    from radixinfer.utils.mp import ZmqSubQueue, pickle_decode
+
+    return ZmqSubQueue(addr, create=create, decoder=decoder or pickle_decode)

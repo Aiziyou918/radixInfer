@@ -1,16 +1,40 @@
+"""Tokenizer worker process: tokenization + incremental detokenization.
+
+Handles TokenizeRequest → TokenizedRequest (sent to scheduler)
+and DetokenizeRequest → StreamChunk (sent to API frontend).
+
+Uses DetokenizeManager for stateful incremental detokenization when a full
+HuggingFace tokenizer is available, so UTF-8 boundaries and CJK characters
+are handled correctly.  Falls back to single-token decode for debug mode.
+"""
 from __future__ import annotations
 
 import multiprocessing as mp
 import time
 from dataclasses import dataclass
 from queue import Empty
-from typing import Any
+from typing import Any, List
 
-from .protocol import DetokenizeRequest, StreamChunk, TokenizeRequest, TokenizedRequest
+from .protocol import (
+    BatchDetokenizeRequest,
+    DetokenizeRequest,
+    StreamChunk,
+    TokenizeRequest,
+    TokenizedRequest,
+)
 from .queues import make_zmq_pull, make_zmq_push
 
+# Unique sentinel used to detect "no message received yet" (distinct from None which is shutdown)
+_SENTINEL = object()
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer backends
+# ---------------------------------------------------------------------------
 
 class SimpleTokenizer:
+    """Character-level debug tokenizer (no real model needed)."""
+
     def __init__(self) -> None:
         self._char_to_id: dict[str, int] = {}
         self._id_to_char: dict[int, str] = {}
@@ -28,10 +52,20 @@ class SimpleTokenizer:
             result.append(self._char_to_id[ch])
         return result or [0]
 
+    def encode_messages(self, messages: list) -> list[int]:
+        """Encode chat messages by concatenating role+content strings."""
+        text = " ".join(
+            f"{m.get('role', '')}: {m.get('content', '')}" for m in messages
+        )
+        return self.encode(text)
+
     def decode_token(self, token_id: int) -> str:
         if token_id == 0:
             return ""
         return self._id_to_char.get(token_id, "?")
+
+    def batch_decode(self, token_id_lists: list[list[int]]) -> list[str]:
+        return ["".join(self.decode_token(t) for t in ids) for ids in token_id_lists]
 
     @property
     def stop_token_ids(self) -> tuple[int, ...]:
@@ -39,20 +73,45 @@ class SimpleTokenizer:
 
 
 class TransformersTokenizerAdapter:
-    def __init__(self, model_name: str) -> None:
-        from transformers import AutoTokenizer
+    """Wraps a HuggingFace tokenizer with the interface expected by this module."""
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    def __init__(self, model_name: str) -> None:
+        from radixinfer.utils.hf import load_tokenizer
+
+        self.tokenizer = load_tokenizer(model_name)
         self._cache: dict[int, str] = {}
 
     def encode(self, text: str) -> list[int]:
         tokens = self.tokenizer.encode(text, add_special_tokens=False)
         return tokens or [self.tokenizer.eos_token_id or 0]
 
+    def encode_messages(self, messages: list) -> list[int]:
+        """Apply the model's chat template and encode the result."""
+        if getattr(self.tokenizer, "chat_template", None):
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            # Fallback: concatenate role+content pairs
+            prompt = "\n".join(
+                f"{m.get('role', '')}: {m.get('content', '')}" for m in messages
+            )
+        tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
+        return tokens or [self.tokenizer.eos_token_id or 0]
+
     def decode_token(self, token_id: int) -> str:
         if token_id not in self._cache:
-            self._cache[token_id] = self.tokenizer.decode([token_id], skip_special_tokens=False)
+            self._cache[token_id] = self.tokenizer.decode(
+                [token_id], skip_special_tokens=False
+            )
         return self._cache[token_id]
+
+    def batch_decode(self, token_id_lists: list[list[int]]) -> list[str]:
+        return self.tokenizer.batch_decode(
+            token_id_lists, skip_special_tokens=False
+        )
 
     @property
     def eos_token_id(self) -> int | None:
@@ -80,8 +139,11 @@ def create_tokenizer_backend(model_name: str | None) -> Any:
     return SimpleTokenizer()
 
 
+# ---------------------------------------------------------------------------
+# Helper queue accessors
+# ---------------------------------------------------------------------------
+
 def _queue_get_nowait(q: Any):
-    """Unified get_nowait that works for mp.Queue, ZMQ queues, and queue.Queue."""
     if hasattr(q, "get_nowait"):
         return q.get_nowait()
     raise Empty
@@ -93,13 +155,17 @@ def _queue_empty(q: Any) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Main worker
+# ---------------------------------------------------------------------------
+
 @dataclass
 class TokenizerProcess:
-    """Tokenizer worker that accepts either mp.Queue or ZMQ queue objects.
+    """Tokenizer worker that handles both tokenization and incremental detokenization.
 
     ingress: receives TokenizeRequest (from API) and DetokenizeRequest (from runtime)
-    runtime_queue: receives TokenizedRequest destined for the scheduler
-    frontend_queue: receives StreamChunk destined for the API frontend
+    runtime_queue: sends TokenizedRequest to the scheduler
+    frontend_queue: sends StreamChunk to the API frontend
     """
 
     ingress: Any  # mp.Queue or ZMQ pull queue
@@ -108,43 +174,85 @@ class TokenizerProcess:
     model_name: str | None = None
 
     def run(self) -> None:
+        from radixinfer.transport.detokenize import DetokenizeManager
+
         tokenizer = create_tokenizer_backend(self.model_name)
+        detok_manager = DetokenizeManager(tokenizer)
+
         while True:
-            try:
-                if hasattr(self.ingress, "get_nowait"):
-                    message = self.ingress.get_nowait()
+            # --- Blocking wait for at least one message ---
+            message = _SENTINEL  # sentinel to detect "nothing yet"
+            while message is _SENTINEL:
+                try:
+                    if hasattr(self.ingress, "get_nowait"):
+                        message = self.ingress.get_nowait()
+                    else:
+                        message = self.ingress.get(timeout=0.1)
+                except Empty:
+                    time.sleep(0.001)
+                    continue
+                except Exception:
+                    time.sleep(0.001)
+                    continue
+
+            # --- Collect all pending messages (non-blocking drain) ---
+            pending: list = [message]
+            while not _queue_empty(self.ingress):
+                try:
+                    pending.append(_queue_get_nowait(self.ingress))
+                except Empty:
+                    break
+
+            # --- Separate by type; detect shutdown sentinel ---
+            tokenize_msgs: list[TokenizeRequest] = []
+            detokenize_msgs: list[DetokenizeRequest] = []
+            shutdown = False
+
+            for msg in pending:
+                if msg is None:
+                    shutdown = True
+                    break  # process already-collected messages, then exit
+                if isinstance(msg, TokenizeRequest):
+                    tokenize_msgs.append(msg)
+                elif isinstance(msg, BatchDetokenizeRequest):
+                    detokenize_msgs.extend(msg.requests)
+                elif isinstance(msg, DetokenizeRequest):
+                    detokenize_msgs.append(msg)
+
+            # --- Tokenize (immediately, one by one) ---
+            for msg in tokenize_msgs:
+                if msg.messages is not None:
+                    token_ids = tokenizer.encode_messages(msg.messages)
                 else:
-                    message = self.ingress.get(timeout=0.1) if hasattr(self.ingress, "get") else None
-            except Empty:
-                time.sleep(0.001)
-                continue
-            except Exception:
-                continue
-            if message is None:
-                return
-            if isinstance(message, TokenizeRequest):
+                    token_ids = tokenizer.encode(msg.prompt)
                 self.runtime_queue.put(
                     TokenizedRequest(
-                        request_id=message.request_id,
-                        token_ids=tokenizer.encode(message.prompt),
-                        sampling=message.sampling,
+                        request_id=msg.request_id,
+                        token_ids=token_ids,
+                        sampling=msg.sampling,
                         eos_token_id=getattr(tokenizer, "eos_token_id", None),
                         stop_token_ids=getattr(tokenizer, "stop_token_ids", ()),
                     )
                 )
-            elif isinstance(message, DetokenizeRequest):
-                text = tokenizer.decode_token(message.token_id) if message.emit_text else ""
-                self.frontend_queue.put(
-                    StreamChunk(
-                        request_id=message.request_id,
-                        token_id=message.token_id,
-                        text=text,
-                        finished=message.finished,
-                        finish_reason=message.finish_reason,
-                        prompt_tokens=message.prompt_tokens,
-                        completion_tokens=message.completion_tokens,
+
+            # --- Incremental detokenize (batch) ---
+            if detokenize_msgs:
+                texts = detok_manager.detokenize(detokenize_msgs)
+                for req, text in zip(detokenize_msgs, texts):
+                    self.frontend_queue.put(
+                        StreamChunk(
+                            request_id=req.request_id,
+                            token_id=req.token_id,
+                            text=text,
+                            finished=req.finished,
+                            finish_reason=req.finish_reason,
+                            prompt_tokens=req.prompt_tokens,
+                            completion_tokens=req.completion_tokens,
+                        )
                     )
-                )
+
+            if shutdown:
+                return
 
 
 def start_tokenizer_process(
@@ -153,9 +261,9 @@ def start_tokenizer_process(
     frontend_queue: Any,
     model_name: str | None = None,
 ) -> mp.Process:
-    """Spawn a daemon tokenizer process.
+    """Spawn a tokenizer worker process.
 
-    Accepts mp.Queue objects or ZMQ queue objects for all three queues.
+    Accepts mp.Queue objects or ZMQ queue objects (or address strings).
     """
     process = mp.Process(
         target=_run_tokenizer_process,
