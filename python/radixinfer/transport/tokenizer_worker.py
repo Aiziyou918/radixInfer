@@ -78,19 +78,41 @@ def create_tokenizer_backend(model_name: str | None) -> Any:
     return SimpleTokenizer()
 
 
+def _queue_get_nowait(q: Any):
+    """Unified get_nowait that works for mp.Queue, ZMQ queues, and queue.Queue."""
+    if hasattr(q, "get_nowait"):
+        return q.get_nowait()
+    raise Empty
+
+
+def _queue_empty(q: Any) -> bool:
+    if hasattr(q, "empty"):
+        return q.empty()
+    return False
+
+
 @dataclass
 class TokenizerProcess:
-    ingress: mp.Queue
-    runtime_queue: mp.Queue
-    frontend_queue: mp.Queue
+    """Tokenizer worker that accepts either mp.Queue or ZMQ queue objects.
+
+    ingress: receives TokenizeRequest (from API) and DetokenizeRequest (from runtime)
+    runtime_queue: receives TokenizedRequest destined for the scheduler
+    frontend_queue: receives StreamChunk destined for the API frontend
+    """
+
+    ingress: Any  # mp.Queue or ZMQ pull queue
+    runtime_queue: Any  # mp.Queue or ZMQ push queue
+    frontend_queue: Any  # mp.Queue or ZMQ push queue
     model_name: str | None = None
 
     def run(self) -> None:
         tokenizer = create_tokenizer_backend(self.model_name)
         while True:
             try:
-                message = self.ingress.get(timeout=0.1)
+                message = self.ingress.get(timeout=0.1) if hasattr(self.ingress, "get") else None
             except Empty:
+                continue
+            except Exception:
                 continue
             if message is None:
                 return
@@ -120,11 +142,15 @@ class TokenizerProcess:
 
 
 def start_tokenizer_process(
-    ingress: mp.Queue,
-    runtime_queue: mp.Queue,
-    frontend_queue: mp.Queue,
+    ingress: Any,
+    runtime_queue: Any,
+    frontend_queue: Any,
     model_name: str | None = None,
 ) -> mp.Process:
+    """Spawn a daemon tokenizer process.
+
+    Accepts mp.Queue objects or ZMQ queue objects for all three queues.
+    """
     process = mp.Process(
         target=TokenizerProcess(ingress, runtime_queue, frontend_queue, model_name).run,
         name="radixinfer-tokenizer",

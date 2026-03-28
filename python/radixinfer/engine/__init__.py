@@ -7,7 +7,8 @@ __all__ = ["Engine", "EngineConfig", "ForwardOutput", "BatchSamplingArgs", "Samp
 
 def build_engine(config):
     """Compatibility shim: build engine from a config or ServerConfig-like object."""
-    if hasattr(config, "engine_type") and getattr(config, "engine_type", "hf") == "debug":
+    kind = getattr(config, "engine_kind", None) or getattr(config, "engine_type", "hf")
+    if kind in ("dummy", "debug"):
         from radixinfer.engine.dummy import DummyEngine
 
         return DummyEngine()

@@ -8,10 +8,14 @@ from typing import Generic, TypeVar
 T = TypeVar("T")
 
 
+# ---------------------------------------------------------------------------
+# Legacy mp.Queue helpers (still used by tokenizer_worker simple path)
+# ---------------------------------------------------------------------------
+
 @dataclass
 class QueuePair(Generic[T]):
-    ingress: mp.Queue[T]
-    egress: mp.Queue[T]
+    ingress: mp.Queue
+    egress: mp.Queue
 
 
 def make_queue() -> mp.Queue:
@@ -26,3 +30,26 @@ def drain_queue(queue: mp.Queue, limit: int) -> list:
         except Empty:
             break
     return items
+
+
+# ---------------------------------------------------------------------------
+# ZMQ-backed queue factories (with mp.Queue fallback when zmq unavailable)
+# ---------------------------------------------------------------------------
+
+def make_zmq_push(addr: str, *, create: bool = True, encoder=None):
+    """Return a push queue bound/connected to *addr*."""
+    from radixinfer.utils.mp import ZmqPushQueue
+    return ZmqPushQueue(addr, create=create, encoder=encoder)
+
+
+def make_zmq_pull(addr: str, *, create: bool = True, decoder=None):
+    """Return a pull queue bound/connected to *addr*."""
+    from radixinfer.utils.mp import ZmqPullQueue
+    return ZmqPullQueue(addr, create=create, decoder=decoder)
+
+
+def make_zmq_pair(addr: str):
+    """Return (push_queue, pull_queue) sharing *addr* — push binds, pull connects."""
+    push = make_zmq_push(addr, create=True)
+    pull = make_zmq_pull(addr, create=False)
+    return push, pull

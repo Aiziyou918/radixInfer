@@ -20,7 +20,7 @@ def parse_args() -> ServerConfig:
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--num-pages", dest="total_pages", type=int, default=4096)
     parser.add_argument("--max-batch-size", type=int, default=32)
-    parser.add_argument("--engine", dest="engine_kind", choices=["dummy", "hf"], default="hf")
+    parser.add_argument("--engine", dest="engine_kind", choices=["dummy", "hf", "real"], default="hf")
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
     return ServerConfig(**vars(args))

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import multiprocessing as mp
 import queue
-from typing import List, NamedTuple, NoReturn, Optional, Set, Tuple, TypeAlias
+from typing import Any, List, NamedTuple, NoReturn, Optional, Set, Tuple, TypeAlias
 
 import torch
 
@@ -12,6 +13,7 @@ from radixinfer.runtime.cache_manager import CacheManager
 from radixinfer.runtime.decode import DecodeManager
 from radixinfer.runtime.prefill import ChunkedReq, PrefillManager
 from radixinfer.runtime.table import TableManager
+from radixinfer.transport.protocol import DetokenizeRequest
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
@@ -131,12 +133,15 @@ class Scheduler:
             self._process_new_req(req)
 
     def _process_new_req(self, req) -> None:
-        # req can be a TokenizedRequest or a dict-like message
-        if hasattr(req, "prompt_token_ids"):
+        from radixinfer.transport.protocol import AbortRequest, TokenizedRequest
+
+        if isinstance(req, TokenizedRequest) or hasattr(req, "token_ids"):
             self.prefill_manager.add_one_req(req)
-        else:
-            # Handle abort or other message types
-            pass
+        elif isinstance(req, AbortRequest) or hasattr(req, "request_id") and not hasattr(req, "token_ids"):
+            uid = getattr(req, "request_id", None)
+            if uid is not None:
+                self.prefill_manager.abort_req(uid)
+                self.decode_manager.abort_req(uid)
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
@@ -154,15 +159,28 @@ class Scheduler:
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token_id = int(next_token.item())
-                finished = not req.can_decode
-                if not req.sampling_params.ignore_eos:
-                    finished |= next_token_id == self.eos_token_id
 
-                self._out_queue.put_nowait({
-                    "uid": req.uid,
-                    "next_token": next_token_id,
-                    "finished": finished,
-                })
+                stop_ids = getattr(req.sampling_params, "stop_token_ids", [])
+                eos_hit = (
+                    not req.sampling_params.ignore_eos
+                    and bool(stop_ids)
+                    and next_token_id in stop_ids
+                )
+                finished = (not req.can_decode) or eos_hit
+                finish_reason = "stop" if eos_hit else ("length" if not req.can_decode else "running")
+
+                prompt_len = len(req.input_ids) - req.output_len
+                completion_len = req.output_len - req.remain_len
+
+                self._out_queue.put_nowait(DetokenizeRequest(
+                    request_id=req.uid,
+                    token_id=next_token_id,
+                    finished=finished,
+                    finish_reason=finish_reason,
+                    emit_text=True,
+                    prompt_tokens=max(0, prompt_len),
+                    completion_tokens=max(0, completion_len),
+                ))
 
                 if finished and req not in self.finished_reqs:
                     self.decode_manager.remove_req(req)
@@ -256,3 +274,165 @@ def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
         mapping_host.to(device, non_blocking=True),
         write_host.to(device, non_blocking=True),
     )
+
+
+# ---------------------------------------------------------------------------
+# _SimpleInlineScheduler — lightweight debug scheduler (no CUDA required)
+# ---------------------------------------------------------------------------
+
+class _SimpleInlineScheduler:
+    """Single-process scheduler using the legacy DummyEngine interface.
+
+    Used when CUDA is unavailable or when engine_kind='dummy'.  Processes one
+    token per request per tick.  No page cache, no batching — purely for debug
+    and integration testing.
+    """
+
+    def __init__(self, output_queue: Any) -> None:
+        from radixinfer.engine.dummy import DummyEngine
+
+        self._engine = DummyEngine()
+        self._output = output_queue
+        self._pending: dict[int, dict] = {}
+
+    def enqueue(self, req: Any) -> None:
+        if hasattr(req, "token_ids"):
+            self._pending[req.request_id] = {
+                "token_ids": list(req.token_ids),
+                "generated": [],
+                "sampling": req.sampling,
+                "stop_ids": list(getattr(req, "stop_token_ids", ())),
+                "eos": getattr(req, "eos_token_id", None),
+            }
+
+    def normal_loop(self) -> None:
+        from radixinfer.engine.base import DecodeInput
+
+        finished_ids = []
+        for uid, state in list(self._pending.items()):
+            all_ids = state["token_ids"] + state["generated"]
+            batch = DecodeInput(request_ids=[uid], token_ids=[all_ids])
+            out = self._engine.decode(batch)
+            next_token = out.next_token_ids[0]
+            state["generated"].append(next_token)
+
+            sampling = state["sampling"]
+            stop_ids = list(state["stop_ids"])
+            eos = state["eos"]
+            if eos is not None:
+                stop_ids.append(eos)
+
+            eos_hit = (
+                not getattr(sampling, "ignore_eos", False)
+                and bool(stop_ids)
+                and next_token in stop_ids
+            )
+            finished = eos_hit or len(state["generated"]) >= sampling.max_tokens
+            finish_reason = "stop" if eos_hit else "length"
+
+            self._output.put_nowait(DetokenizeRequest(
+                request_id=uid,
+                token_id=next_token,
+                finished=finished,
+                finish_reason=finish_reason,
+                emit_text=True,
+                prompt_tokens=len(state["token_ids"]),
+                completion_tokens=len(state["generated"]),
+            ))
+
+            if finished:
+                finished_ids.append(uid)
+
+        for uid in finished_ids:
+            del self._pending[uid]
+
+    def run_forever(self) -> NoReturn:
+        import time
+
+        while True:
+            self.normal_loop()
+            if not self._pending:
+                time.sleep(0.001)
+
+
+def _has_cuda() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available() and torch.cuda.device_count() > 0
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# SchedulerRuntime — lightweight wrapper for api/server.py integration
+# ---------------------------------------------------------------------------
+
+class SchedulerRuntime:
+    """Wraps Scheduler and bridges external queue I/O for api/server.py.
+
+    Automatically selects the implementation:
+    - Debug / no-GPU: _SimpleInlineScheduler backed by DummyEngine (no CUDA).
+    - Real GPU:       Scheduler backed by the new Engine with full hot path.
+
+    Inline mode: _drain_ingress() + _tick() are called cooperatively.
+    Multiprocess mode: run_forever() blocks in a subprocess.
+    """
+
+    def __init__(self, config: Any, runtime_ingress: Any, output_queue: Any) -> None:
+        from radixinfer.config import server_config_to_scheduler_config
+
+        sched_cfg = server_config_to_scheduler_config(config)
+        use_debug = sched_cfg.use_dummy_weight or not _has_cuda()
+
+        if use_debug:
+            self._impl: Any = _SimpleInlineScheduler(output_queue)
+        else:
+            sched = Scheduler(sched_cfg)
+            sched._out_queue = output_queue
+            self._impl = sched
+
+        self._ingress = runtime_ingress
+
+    def _drain_ingress(self) -> None:
+        """Read all pending items from runtime_ingress into the impl queue."""
+        while True:
+            try:
+                req = self._ingress.get_nowait()
+            except Exception:
+                break
+            if req is None:
+                break
+            self._impl.enqueue(req)
+
+    def _tick(self) -> None:
+        """Run one scheduling iteration (non-blocking)."""
+        self._impl.normal_loop()
+
+    @torch.inference_mode()
+    def run_forever(self) -> NoReturn:
+        """Blocking loop — intended for subprocess use."""
+        while True:
+            self._drain_ingress()
+            self._impl.normal_loop()
+
+
+def _run_scheduler_process(config: Any, runtime_ingress: Any, output_queue: Any) -> None:
+    """Entry point for the runtime subprocess."""
+    runtime = SchedulerRuntime(config, runtime_ingress, output_queue)
+    runtime.run_forever()
+
+
+def start_runtime_process(
+    config: Any,
+    runtime_ingress: Any,
+    output_queue: Any,
+) -> mp.Process:
+    """Spawn a daemon subprocess running the Scheduler loop."""
+    process = mp.Process(
+        target=_run_scheduler_process,
+        args=(config, runtime_ingress, output_queue),
+        name="radixinfer-runtime",
+        daemon=True,
+    )
+    process.start()
+    return process
