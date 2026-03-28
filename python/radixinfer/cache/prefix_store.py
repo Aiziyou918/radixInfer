@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from .page_pool import PageSpan
 
@@ -42,6 +43,15 @@ class PrefixHit:
     cache_key: PrefixCacheKey | None = None
 
 
+class SizeInfo(NamedTuple):
+    evictable_size: int
+    protected_size: int
+
+    @property
+    def total_size(self) -> int:
+        return self.evictable_size + self.protected_size
+
+
 @dataclass
 class RadixNode:
     node_id: int
@@ -55,6 +65,10 @@ class RadixNode:
     @property
     def total_length(self) -> int:
         return self.full_span.token_count
+
+    @property
+    def length(self) -> int:
+        return len(self.token_chunk)
 
     @property
     def is_root(self) -> bool:
@@ -76,6 +90,8 @@ class PrefixStore:
         self._next_node_id = 1
         self._root = RadixNode(node_id=0, token_chunk=(), full_span=PageSpan(page_ids=(), token_count=0))
         self._nodes: dict[int, RadixNode] = {self._root.node_id: self._root}
+        self._evictable_size = 0
+        self._protected_size = 0
 
     def match(self, tokens: list[int]) -> PrefixHit:
         normalized = _normalize_prefix(tokens, self.page_size)
@@ -93,17 +109,13 @@ class PrefixStore:
         node = self._get_node(key)
         if node is None:
             return
-        node.ref_count += 1
-        node.timestamp_ns = time.monotonic_ns()
+        self._update_lock_state(node, unlock=False)
 
     def unlock(self, key: PrefixCacheKey | None) -> None:
         node = self._get_node(key)
         if node is None:
             return
-        if node.ref_count <= 0:
-            raise ValueError("prefix entry ref_count underflow")
-        node.ref_count -= 1
-        node.timestamp_ns = time.monotonic_ns()
+        self._update_lock_state(node, unlock=True)
 
     def insert(self, tokens: list[int], span: PageSpan) -> tuple[PrefixCacheKey | None, list[PageSpan]]:
         normalized = _normalize_prefix(tokens, self.page_size)
@@ -130,6 +142,13 @@ class PrefixStore:
 
     def entry_ref_count(self, key: PrefixCacheKey) -> int:
         return self._nodes[key.node_id].ref_count
+
+    @property
+    def size_info(self) -> SizeInfo:
+        return SizeInfo(
+            evictable_size=self._evictable_size,
+            protected_size=self._protected_size,
+        )
 
     def _get_node(self, key: PrefixCacheKey | None) -> RadixNode | None:
         if key is None:
@@ -174,9 +193,19 @@ class PrefixStore:
             ref_count=node.ref_count,
             timestamp_ns=node.timestamp_ns,
         )
+        if split_node.ref_count == 0:
+            self._evictable_size += split_node.length
+        else:
+            self._protected_size += split_node.length
         parent.children[_key_fn(split_node.token_chunk, self.page_size)] = split_node
         node.parent = split_node
+        original_length = node.length
         node.token_chunk = node.token_chunk[prefix_len:]
+        if node.ref_count == 0:
+            self._evictable_size -= prefix_len
+        else:
+            self._protected_size -= prefix_len
+        assert node.length == original_length - prefix_len
         split_node.children[_key_fn(node.token_chunk, self.page_size)] = node
         self._nodes[split_node.node_id] = split_node
         return split_node
@@ -190,6 +219,7 @@ class PrefixStore:
         )
         parent.children[_key_fn(token_chunk, self.page_size)] = node
         self._nodes[node.node_id] = node
+        self._evictable_size += node.length
         return node
 
     def _evict_over_capacity(self) -> list[PageSpan]:
@@ -216,9 +246,50 @@ class PrefixStore:
         if parent is None:
             raise ValueError("cannot remove root")
         del parent.children[_key_fn(node.token_chunk, self.page_size)]
+        if node.ref_count == 0:
+            self._evictable_size -= node.length
+        else:
+            self._protected_size -= node.length
         del self._nodes[node.node_id]
 
     def _allocate_node_id(self) -> int:
         node_id = self._next_node_id
         self._next_node_id += 1
         return node_id
+
+    def _update_lock_state(self, node: RadixNode, *, unlock: bool) -> None:
+        current = node
+        now = time.monotonic_ns()
+        while not current.is_root:
+            if unlock:
+                if current.ref_count <= 0:
+                    raise ValueError("prefix entry ref_count underflow")
+                current.ref_count -= 1
+                if current.ref_count == 0:
+                    self._protected_size -= current.length
+                    self._evictable_size += current.length
+            else:
+                if current.ref_count == 0:
+                    self._evictable_size -= current.length
+                    self._protected_size += current.length
+                current.ref_count += 1
+            current.timestamp_ns = now
+            assert current.parent is not None
+            current = current.parent
+
+    def check_integrity(self) -> None:
+        evictable = 0
+        protected = 0
+        for node in self._nodes.values():
+            if node.is_root:
+                continue
+            if node.ref_count == 0:
+                evictable += node.length
+            else:
+                protected += node.length
+        if evictable != self._evictable_size or protected != self._protected_size:
+            raise RuntimeError(
+                "PrefixStore accounting mismatch: "
+                f"expected evictable={evictable}, protected={protected}, "
+                f"got evictable={self._evictable_size}, protected={self._protected_size}"
+            )
