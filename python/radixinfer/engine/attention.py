@@ -514,6 +514,125 @@ def create_attention_backend(backend: str, config: ModelConfig) -> BaseAttnBacke
     return _BACKEND_REGISTRY[backend](config)
 
 
+# ---------------------------------------------------------------------------
+# HuggingFace fallback attention (used by HuggingFaceEngine for testing)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PagedAttentionPlan:
+    """Paged attention metadata for a single request."""
+    table_slot: int
+    token_count: int
+    write_position: int
+    page_ids: tuple
+    page_indices: tuple
+    kv_page_indices: tuple
+    last_page_len: int
+
+
+@dataclass
+class PreparedRequest:
+    input_ids: torch.Tensor
+    past_key_values: object  # HF-format past_key_values tuple or None
+    paged_plan: PagedAttentionPlan | None = None
+
+
+class PagedAttentionBackend:
+    """Minimal paged-attention backend used by test infrastructure."""
+
+    def __init__(self, page_size: int) -> None:
+        self.page_size = page_size
+
+    def prepare_batch(self, token_ids: list, kv_caches: list, metadata) -> list:
+        result = []
+        for i, tokens in enumerate(token_ids):
+            plan = None
+            if metadata is not None and i < len(metadata.request_paged_states):
+                ps = metadata.request_paged_states[i]
+                plan = PagedAttentionPlan(
+                    table_slot=ps.table_slot,
+                    token_count=ps.token_count,
+                    write_position=ps.write_position,
+                    page_ids=ps.page_ids,
+                    page_indices=ps.page_indices,
+                    kv_page_indices=ps.kv_page_indices,
+                    last_page_len=ps.last_page_len,
+                )
+            input_ids = torch.tensor(tokens, dtype=torch.long)
+            result.append(PreparedRequest(input_ids=input_ids, past_key_values=None, paged_plan=plan))
+        return result
+
+
+class HuggingFaceFallbackAttentionBackend(PagedAttentionBackend):
+    """Bridges HuggingFaceEngine with the paged-KV-cache test infrastructure.
+
+    This is NOT a BaseAttnBackend.  HuggingFace models handle attention
+    internally; this class converts between radixInfer's KVCacheView
+    format and HuggingFace's past_key_values format, and also populates
+    paged attention plans from batch metadata.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_heads: int,
+        head_dim: int,
+        page_size: int,
+        device: str,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__(page_size=page_size)
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.device = device
+        self.dtype = dtype
+
+    def prepare_batch(self, token_ids: list, kv_caches: list, metadata) -> list:
+        prepared = super().prepare_batch(token_ids, kv_caches, metadata)
+        for i, req in enumerate(prepared):
+            kv = kv_caches[i] if i < len(kv_caches) else None
+            past_kv = None
+            if kv is not None and kv.keys.shape[2] == self.num_heads and kv.keys.shape[3] == self.head_dim:
+                # kv.keys: (num_layers, pages*page_size, kv_heads, head_dim)
+                # HF expects: tuple[(key, val)] per layer, each (1, heads, seq, head_dim)
+                t = kv.token_count
+                past_kv = tuple(
+                    (
+                        kv.keys[l, :t].transpose(0, 1).unsqueeze(0).to(self.device),
+                        kv.values[l, :t].transpose(0, 1).unsqueeze(0).to(self.device),
+                    )
+                    for l in range(kv.keys.shape[0])
+                )
+            req.past_key_values = past_kv
+            req.input_ids = req.input_ids.unsqueeze(0).to(self.device)
+        return prepared
+
+    def extract_cache_writes(self, outputs: list, token_counts: list) -> list:
+        """Extract K/V from HF model outputs as AttentionCacheWrite objects."""
+        from radixinfer.engine.base import AttentionCacheWrite
+
+        result = []
+        for output, count in zip(outputs, token_counts):
+            pkv = output.past_key_values  # tuple[(key, val)] per layer
+            # key per layer: (1, num_heads, seq_len, head_dim)
+            # → (seq_len, num_heads, head_dim) → stack → (num_layers, seq_len, ...)
+            keys = torch.stack(
+                [pkv[l][0].squeeze(0).transpose(0, 1) for l in range(len(pkv))]
+            )
+            values = torch.stack(
+                [pkv[l][1].squeeze(0).transpose(0, 1) for l in range(len(pkv))]
+            )
+            result.append(
+                AttentionCacheWrite(
+                    keys=keys[:, :count],
+                    values=values[:, :count],
+                    token_count=count,
+                )
+            )
+        return result
+
+
 __all__ = [
     "BaseAttnMetadata",
     "BaseAttnBackend",
@@ -525,4 +644,8 @@ __all__ = [
     "create_attention_backend",
     "validate_attn_backend",
     "BaseCaptureData",
+    "PreparedRequest",
+    "PagedAttentionPlan",
+    "PagedAttentionBackend",
+    "HuggingFaceFallbackAttentionBackend",
 ]

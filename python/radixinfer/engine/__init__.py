@@ -12,5 +12,11 @@ def build_engine(config):
         from radixinfer.engine.dummy import DummyEngine
 
         return DummyEngine()
+    if kind == "hf":
+        from radixinfer.engine.hf import HuggingFaceEngine
+
+        model = getattr(config, "model", None) or getattr(config, "model_path", "debug")
+        device = getattr(config, "device", "auto")
+        return HuggingFaceEngine(model_name=model, device=device)
     # Default to real engine
     return Engine(config)

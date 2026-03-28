@@ -82,6 +82,12 @@ class Engine:
             config.attention_backend, config.model_config
         )
 
+        # MoE backend (only for MoE models)
+        if config.model_config.is_moe:
+            from radixinfer.moe import create_moe_backend
+            moe_backend_name = config.moe_backend if config.moe_backend != "auto" else "fused"
+            self.ctx.moe_backend = self.moe_backend = create_moe_backend(moe_backend_name)
+
         # Sampler
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
 
@@ -235,3 +241,6 @@ def _adjust_config(config: EngineConfig) -> None:
         override("attention_backend", backend)
         if config.tp_info.is_primary():
             print(f"Auto-selected attention backend: {backend}")
+
+    if config.moe_backend == "auto":
+        override("moe_backend", "fused")
