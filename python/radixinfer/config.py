@@ -42,21 +42,31 @@ class ServerConfig:
         return "ipc:///tmp/radixinfer_0" + self._unique_suffix
 
 
+def _device_to_rank(device: str) -> int:
+    """Parse 'cuda:N' → N, 'auto' / 'cuda' → 0."""
+    if device.startswith("cuda:"):
+        try:
+            return int(device.split(":")[1])
+        except (IndexError, ValueError):
+            pass
+    return 0
+
+
 def server_config_to_scheduler_config(cfg: ServerConfig):
     """Convert a ServerConfig (high-level API config) to a SchedulerConfig
     that the Engine and Scheduler can consume.
-
-    Single-GPU (rank=0, size=1) by default.  dtype is float16 unless the
-    model name / device hints suggest otherwise.
     """
     import torch
 
     from radixinfer.distributed import DistributedInfo
     from radixinfer.runtime.scheduler_config import SchedulerConfig
 
+    device_id = _device_to_rank(cfg.device)
+
     return SchedulerConfig(
         model_path=cfg.model,
         tp_info=DistributedInfo(rank=0, size=cfg.tp_size),
+        device_id=device_id,
         dtype=torch.float16,
         page_size=cfg.page_size,
         max_running_req=cfg.max_running_requests,

@@ -32,7 +32,8 @@ class Engine:
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _adjust_config(config)
 
-        self.device = torch.device(f"cuda:{config.tp_info.rank}")
+        gpu_id = config.device_id if config.device_id is not None else config.tp_info.rank
+        self.device = torch.device(f"cuda:{gpu_id}")
         torch.cuda.set_device(self.device)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()

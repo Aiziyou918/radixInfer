@@ -29,6 +29,7 @@ class EngineConfig:
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None
+    device_id: int | None = None  # override physical GPU index; defaults to tp_info.rank
 
     @cached_property
     def hf_config(self):
