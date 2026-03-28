@@ -38,14 +38,16 @@ def drain_queue(queue: mp.Queue, limit: int) -> list:
 
 def make_zmq_push(addr: str, *, create: bool = True, encoder=None):
     """Return a push queue bound/connected to *addr*."""
-    from radixinfer.utils.mp import ZmqPushQueue
-    return ZmqPushQueue(addr, create=create, encoder=encoder)
+    from radixinfer.utils.mp import ZmqPushQueue, pickle_encode
+
+    return ZmqPushQueue(addr, create=create, encoder=encoder or pickle_encode)
 
 
 def make_zmq_pull(addr: str, *, create: bool = True, decoder=None):
     """Return a pull queue bound/connected to *addr*."""
-    from radixinfer.utils.mp import ZmqPullQueue
-    return ZmqPullQueue(addr, create=create, decoder=decoder)
+    from radixinfer.utils.mp import ZmqPullQueue, pickle_decode
+
+    return ZmqPullQueue(addr, create=create, decoder=decoder or pickle_decode)
 
 
 def make_zmq_pair(addr: str):

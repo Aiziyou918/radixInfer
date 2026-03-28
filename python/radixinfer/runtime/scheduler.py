@@ -14,6 +14,7 @@ from radixinfer.runtime.decode import DecodeManager
 from radixinfer.runtime.prefill import ChunkedReq, PrefillManager
 from radixinfer.runtime.table import TableManager
 from radixinfer.transport.protocol import DetokenizeRequest
+from radixinfer.transport.queues import make_zmq_pull, make_zmq_push
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
@@ -418,6 +419,10 @@ class SchedulerRuntime:
 
 def _run_scheduler_process(config: Any, runtime_ingress: Any, output_queue: Any) -> None:
     """Entry point for the runtime subprocess."""
+    if isinstance(runtime_ingress, str):
+        runtime_ingress = make_zmq_pull(runtime_ingress, create=True)
+    if isinstance(output_queue, str):
+        output_queue = make_zmq_push(output_queue, create=False)
     runtime = SchedulerRuntime(config, runtime_ingress, output_queue)
     runtime.run_forever()
 

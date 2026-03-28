@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -28,7 +29,21 @@ class ServerConfig:
     tokenizer_name: str | None = None
     device: str = "auto"
     start_method: str = "spawn"
+    use_zmq: bool = True
     stop_token_ids: tuple[int, ...] = field(default_factory=tuple)
+    _unique_suffix: str = field(default_factory=lambda: f".pid={os.getpid()}")
+
+    @property
+    def zmq_tokenizer_addr(self) -> str:
+        return "ipc:///tmp/radixinfer_3" + self._unique_suffix
+
+    @property
+    def zmq_frontend_addr(self) -> str:
+        return "ipc:///tmp/radixinfer_4" + self._unique_suffix
+
+    @property
+    def zmq_backend_addr(self) -> str:
+        return "ipc:///tmp/radixinfer_0" + self._unique_suffix
 
 
 def server_config_to_scheduler_config(cfg: ServerConfig):
@@ -54,4 +69,5 @@ def server_config_to_scheduler_config(cfg: ServerConfig):
         num_page_override=cfg.total_pages,
         max_extend_tokens=cfg.max_prefill_tokens,
         use_dummy_weight=use_dummy,
+        _unique_suffix=cfg._unique_suffix,
     )

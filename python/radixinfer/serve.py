@@ -22,6 +22,9 @@ def parse_args() -> ServerConfig:
     parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--engine", dest="engine_kind", choices=["dummy", "hf", "real"], default="hf")
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--start-method", choices=["spawn", "inline"], default="spawn")
+    parser.add_argument("--disable-zmq", dest="use_zmq", action="store_false")
+    parser.set_defaults(use_zmq=True)
     args = parser.parse_args()
     return ServerConfig(**vars(args))
 

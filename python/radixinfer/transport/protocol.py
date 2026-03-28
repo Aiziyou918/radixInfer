@@ -11,6 +11,10 @@ class SamplingParams:
     top_k: int = -1
     top_p: float = 1.0
     ignore_eos: bool = False
+    stop: tuple[str, ...] = ()
+    n: int = 1
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
 
 
 @dataclass(frozen=True)

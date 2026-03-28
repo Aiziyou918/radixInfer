@@ -10,10 +10,27 @@ here — that only works within a single process.
 from __future__ import annotations
 
 import multiprocessing as mp
+import pickle
 import threading
 from typing import Any, Callable, Generic, TypeVar
 
 T = TypeVar("T")
+
+
+def pickle_encode(item: Any) -> bytes:
+    return pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def pickle_decode(raw: bytes) -> Any:
+    return pickle.loads(raw)
+
+
+def has_zmq() -> bool:
+    try:
+        import zmq  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 class _FallbackQueue(Generic[T]):
@@ -29,6 +46,9 @@ class _FallbackQueue(Generic[T]):
 
     def put(self, item: T) -> None:
         self._q.put(self._encoder(item))
+
+    def put_nowait(self, item: T) -> None:
+        self.put(item)
 
     def put_raw(self, raw: bytes) -> None:
         self._q.put(raw)
@@ -83,6 +103,7 @@ def _make_queue(addr: str, *, create: bool, encoder=None, decoder=None, socket_t
                 sock.connect(addr)
         else:
             raise ValueError(f"Unknown socket_type: {socket_type}")
+        sock.setsockopt(zmq.LINGER, 0)
 
         return _ZmqQueue(sock, encoder=encoder, decoder=decoder)
 
@@ -98,6 +119,9 @@ class _ZmqQueue(Generic[T]):
 
     def put(self, item: T) -> None:
         self._sock.send(self._encoder(item))
+
+    def put_nowait(self, item: T) -> None:
+        self.put(item)
 
     def put_raw(self, raw: bytes) -> None:
         self._sock.send(raw)

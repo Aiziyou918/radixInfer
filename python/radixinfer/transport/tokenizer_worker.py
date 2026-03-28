@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import time
 from dataclasses import dataclass
 from queue import Empty
 from typing import Any
 
 from .protocol import DetokenizeRequest, StreamChunk, TokenizeRequest, TokenizedRequest
+from .queues import make_zmq_pull, make_zmq_push
 
 
 class SimpleTokenizer:
@@ -109,8 +111,12 @@ class TokenizerProcess:
         tokenizer = create_tokenizer_backend(self.model_name)
         while True:
             try:
-                message = self.ingress.get(timeout=0.1) if hasattr(self.ingress, "get") else None
+                if hasattr(self.ingress, "get_nowait"):
+                    message = self.ingress.get_nowait()
+                else:
+                    message = self.ingress.get(timeout=0.1) if hasattr(self.ingress, "get") else None
             except Empty:
+                time.sleep(0.001)
                 continue
             except Exception:
                 continue
@@ -152,9 +158,25 @@ def start_tokenizer_process(
     Accepts mp.Queue objects or ZMQ queue objects for all three queues.
     """
     process = mp.Process(
-        target=TokenizerProcess(ingress, runtime_queue, frontend_queue, model_name).run,
+        target=_run_tokenizer_process,
+        args=(ingress, runtime_queue, frontend_queue, model_name),
         name="radixinfer-tokenizer",
         daemon=True,
     )
     process.start()
     return process
+
+
+def _run_tokenizer_process(
+    ingress: Any,
+    runtime_queue: Any,
+    frontend_queue: Any,
+    model_name: str | None,
+) -> None:
+    if isinstance(ingress, str):
+        ingress = make_zmq_pull(ingress, create=True)
+    if isinstance(runtime_queue, str):
+        runtime_queue = make_zmq_push(runtime_queue, create=False)
+    if isinstance(frontend_queue, str):
+        frontend_queue = make_zmq_push(frontend_queue, create=False)
+    TokenizerProcess(ingress, runtime_queue, frontend_queue, model_name).run()
