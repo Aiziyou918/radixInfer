@@ -24,6 +24,8 @@ class SchedulerRuntime:
             total_pages=config.total_pages,
             page_size=config.page_size,
             kv_cache_dim=config.kv_cache_dim,
+            kv_num_layers=config.kv_num_layers,
+            kv_num_heads=config.kv_num_heads,
         )
         self.prefix_store = PrefixStore(
             capacity=config.prefix_cache_capacity,

@@ -34,6 +34,8 @@ class PagePool:
     total_pages: int
     page_size: int
     kv_cache_dim: int = 16
+    kv_num_layers: int = 2
+    kv_num_heads: int = 2
     _free_pages: list[int] = field(init=False)
     _page_data: dict[int, list[int]] = field(init=False)
     _key_cache: torch.Tensor = field(init=False)
@@ -43,7 +45,13 @@ class PagePool:
         self._free_pages = list(range(self.total_pages))
         self._page_data = {page_id: [] for page_id in range(self.total_pages)}
         self._key_cache = torch.zeros(
-            (self.total_pages, self.page_size, self.kv_cache_dim),
+            (
+                self.kv_num_layers,
+                self.total_pages,
+                self.page_size,
+                self.kv_num_heads,
+                self.kv_cache_dim,
+            ),
             dtype=torch.float32,
         )
         self._value_cache = torch.zeros_like(self._key_cache)
@@ -105,25 +113,37 @@ class PagePool:
 
     def read_kv(self, span: PageSpan) -> KVCacheView:
         used_pages = len(span.page_ids)
-        keys = self._key_cache[list(span.page_ids)].reshape(used_pages * self.page_size, self.kv_cache_dim)
-        values = self._value_cache[list(span.page_ids)].reshape(
-            used_pages * self.page_size, self.kv_cache_dim
+        page_index = list(span.page_ids)
+        keys = self._key_cache[:, page_index].reshape(
+            self.kv_num_layers,
+            used_pages * self.page_size,
+            self.kv_num_heads,
+            self.kv_cache_dim,
+        )
+        values = self._value_cache[:, page_index].reshape(
+            self.kv_num_layers,
+            used_pages * self.page_size,
+            self.kv_num_heads,
+            self.kv_cache_dim,
         )
         return KVCacheView(
-            keys=keys[: span.token_count].clone(),
-            values=values[: span.token_count].clone(),
+            keys=keys[:, : span.token_count].clone(),
+            values=values[:, : span.token_count].clone(),
             token_count=span.token_count,
         )
 
     def release(self, reservation: PageReservation) -> None:
         for page_id in reservation.page_ids:
             self._page_data[page_id] = []
-            self._key_cache[page_id].zero_()
-            self._value_cache[page_id].zero_()
+            self._key_cache[:, page_id].zero_()
+            self._value_cache[:, page_id].zero_()
         self._free_pages.extend(reservation.page_ids)
         self._free_pages.sort()
 
     def _write_kv(self, page_id: int, slot: int, token: int) -> None:
         base = torch.arange(self.kv_cache_dim, dtype=torch.float32)
-        self._key_cache[page_id, slot] = base + float(token)
-        self._value_cache[page_id, slot] = base * 0.5 + float(token)
+        for layer_id in range(self.kv_num_layers):
+            for head_id in range(self.kv_num_heads):
+                scale = float(token + layer_id * 10 + head_id)
+                self._key_cache[layer_id, page_id, slot, head_id] = base + scale
+                self._value_cache[layer_id, page_id, slot, head_id] = base * 0.5 + scale

@@ -16,6 +16,8 @@ class ServerConfig:
     page_size: int = 16
     total_pages: int = 4096
     kv_cache_dim: int = 16
+    kv_num_layers: int = 2
+    kv_num_heads: int = 2
     max_batch_size: int = 32
     engine_kind: Literal["dummy", "hf"] = "hf"
     prefix_cache_capacity: int = 4096

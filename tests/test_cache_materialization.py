@@ -127,6 +127,8 @@ def test_decode_input_carries_kv_cache_view() -> None:
             page_size=2,
             total_pages=16,
             kv_cache_dim=8,
+            kv_num_layers=3,
+            kv_num_heads=2,
         ),
         Queue(),
         Queue(),
@@ -148,4 +150,4 @@ def test_decode_input_carries_kv_cache_view() -> None:
     runtime.engine.decode = fake_decode  # type: ignore[method-assign]
     runtime._run_decode([3])
     assert seen["token_ids"] == [[7, 8, 9, 10]]
-    assert seen["kv_shapes"] == [((4, 8), (4, 8))]
+    assert seen["kv_shapes"] == [((3, 4, 2, 8), (3, 4, 2, 8))]
