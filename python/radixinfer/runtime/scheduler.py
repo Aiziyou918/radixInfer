@@ -11,6 +11,7 @@ from radixinfer.engine.engine import Engine, ForwardOutput
 from radixinfer.engine.sample import BatchSamplingArgs
 from radixinfer.runtime.cache_manager import CacheManager
 from radixinfer.runtime.decode import DecodeManager
+from radixinfer.runtime.io import SchedulerIOMixin
 from radixinfer.runtime.prefill import ChunkedReq, PrefillManager
 from radixinfer.runtime.table import TableManager
 from radixinfer.transport.protocol import DetokenizeRequest
@@ -29,19 +30,20 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "tuple[ForwardInput, ForwardOutput]"
 
 
-class Scheduler:
+class Scheduler(SchedulerIOMixin):
     """Overlap-scheduled inference scheduler, aligned with mini-sglang Scheduler.
 
+    Inherits from SchedulerIOMixin which wires up ZMQ-based (or queue-based in
+    offline mode) receive_msg() / send_result() methods.
+
     Key responsibilities:
-    - Receive tokenized requests via queue
+    - Receive tokenized requests via receive_msg()
     - Schedule prefill / decode batches
     - Overlap GPU execution with batch post-processing (CPU-side)
-    - Send detokenize results back via result queue
+    - Send detokenize results back via send_result()
     """
 
-    def __init__(self, config, engine: Engine | None = None):
-        from radixinfer.runtime.scheduler_config import SchedulerConfig
-
+    def __init__(self, config, engine: Engine | None = None, tp_cpu_group=None):
         if engine is None:
             engine = Engine(config)
 
@@ -49,6 +51,7 @@ class Scheduler:
         self.device = engine.device
         self.stream = torch.cuda.Stream(device=self.device)
         self.engine_stream_ctx = torch.cuda.stream(engine.stream)
+        self._config = config
         torch.cuda.set_stream(self.stream)
 
         self.table_manager = TableManager(config.max_running_req, engine.page_table)
@@ -67,15 +70,14 @@ class Scheduler:
         self.prefill_budget = getattr(config, "max_extend_tokens", 8192)
         self.token_pool = self.table_manager.token_pool
 
-        # Simple queue-based I/O (fallback, ZMQ upgrade in Phase 10)
-        self._in_queue: queue.Queue = queue.Queue()
-        self._out_queue: queue.Queue = queue.Queue()
-
         # EOS tracking from tokenizer
         self.eos_token_id: int = 0
 
+        # Set up I/O via mixin (ZMQ for production, queue.Queue for offline/tests)
+        SchedulerIOMixin.__init__(self, config, tp_cpu_group=tp_cpu_group)
+
     def enqueue(self, request) -> None:
-        """Put a tokenized request into the input queue."""
+        """Put a tokenized request into the offline input queue (offline mode only)."""
         self._in_queue.put(request)
 
     def dequeue_results(self) -> list:
@@ -86,13 +88,36 @@ class Scheduler:
         return results
 
     def run_when_idle(self) -> None:
+        """Called while blocking-waiting for a new message (overrides mixin hook)."""
         self.cache_manager.check_integrity()
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
-        data = None
-        while True:
-            data = self.overlap_loop(data)
+        # Mirror mini-sglang's two-branch design:
+        #
+        # non-overlap branch:
+        #   Enter engine_stream_ctx once and hold it for the entire loop so
+        #   that every normal_loop() → _forward() → engine.forward_batch()
+        #   call sees torch.cuda.current_stream() == engine.stream.
+        #   wait_stream ensures the scheduler stream has caught up before the
+        #   engine stream starts executing.
+        #
+        # overlap branch:
+        #   overlap_loop() manages engine_stream_ctx itself per-iteration.
+        #   We only assert the entry condition so bugs are caught early.
+        if getattr(self._config, "disable_overlap_scheduling", False):
+            with self.engine_stream_ctx:
+                self.engine.stream.wait_stream(self.stream)
+                while True:
+                    self.normal_loop()
+        else:
+            assert torch.cuda.current_stream() == self.stream, (
+                "run_forever (overlap mode) must be entered while the scheduler "
+                "stream is current; call torch.cuda.set_stream(self.stream) first."
+            )
+            data = None
+            while True:
+                data = self.overlap_loop(data)
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         blocking = not (
@@ -122,16 +147,9 @@ class Scheduler:
             self._process_last_data(ongoing_data)
 
     def _drain_input_queue(self, blocking: bool) -> None:
-        if blocking:
-            self.run_when_idle()
-            try:
-                req = self._in_queue.get(timeout=0.5)
-                self._process_new_req(req)
-            except queue.Empty:
-                return
-        while not self._in_queue.empty():
-            req = self._in_queue.get_nowait()
-            self._process_new_req(req)
+        msgs = self.receive_msg(blocking=blocking)
+        for msg in msgs:
+            self._process_new_req(msg)
 
     def _process_new_req(self, req) -> None:
         from radixinfer.transport.protocol import AbortRequest, TokenizedRequest
@@ -153,6 +171,7 @@ class Scheduler:
         copy_done.synchronize()
 
         new_finished: Set[Req] = set()
+        results: list[DetokenizeRequest] = []
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
@@ -173,7 +192,7 @@ class Scheduler:
                 prompt_len = len(req.input_ids) - req.output_len
                 completion_len = req.output_len - req.remain_len
 
-                self._out_queue.put_nowait(DetokenizeRequest(
+                results.append(DetokenizeRequest(
                     request_id=req.uid,
                     token_id=next_token_id,
                     finished=finished,
@@ -191,6 +210,7 @@ class Scheduler:
                     self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished
+        self.send_result(results)
 
     def _free_req_resources(self, req: Req) -> None:
         self.table_manager.free(req.table_idx)
@@ -685,20 +705,44 @@ class SchedulerRuntime:
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
-        """Blocking loop — intended for subprocess use."""
-        while True:
-            self._drain_ingress()
-            if self._impl is not None:
-                self._impl.normal_loop()
+        """Blocking loop — intended for subprocess use.
+
+        When a real Scheduler is present the entire loop runs inside
+        engine_stream_ctx so that every normal_loop() → forward_batch()
+        call sees torch.cuda.current_stream() == engine.stream.
+        This mirrors mini-sglang's DISABLE_OVERLAP_SCHEDULING branch in
+        Scheduler.run_forever() and satisfies the engine assertion.
+        """
+        if self._impl is not None:
+            with self._impl.engine_stream_ctx:
+                self._impl.engine.stream.wait_stream(self._impl.stream)
+                while True:
+                    self._drain_ingress()
+                    self._impl.normal_loop()
+        else:
+            while True:
+                self._drain_ingress()
+                self._debug_tick()
 
 
-def _run_scheduler_process(config: Any, runtime_ingress: Any, output_queue: Any) -> None:
+def _run_scheduler_process(
+    config: Any,
+    runtime_ingress: Any,
+    output_queue: Any,
+    ack_queue: Any = None,
+) -> None:
     """Entry point for the runtime subprocess."""
     if isinstance(runtime_ingress, str):
         runtime_ingress = make_zmq_pull(runtime_ingress, create=True)
     if isinstance(output_queue, str):
         output_queue = make_zmq_push(output_queue, create=False)
     runtime = SchedulerRuntime(config, runtime_ingress, output_queue)
+    # Signal to the parent process that initialisation (model loading) is done
+    if ack_queue is not None:
+        try:
+            ack_queue.put("Scheduler is ready")
+        except Exception:
+            pass
     runtime.run_forever()
 
 
@@ -706,11 +750,13 @@ def start_runtime_process(
     config: Any,
     runtime_ingress: Any,
     output_queue: Any,
+    *,
+    ack_queue: Any = None,
 ) -> mp.Process:
     """Spawn a daemon subprocess running the Scheduler loop."""
     process = mp.Process(
         target=_run_scheduler_process,
-        args=(config, runtime_ingress, output_queue),
+        args=(config, runtime_ingress, output_queue, ack_queue),
         name="radixinfer-runtime",
         daemon=True,
     )
