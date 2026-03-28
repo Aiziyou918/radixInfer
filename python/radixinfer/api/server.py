@@ -100,31 +100,84 @@ class AppState:
     listeners: dict[int, asyncio.Queue[StreamChunk]] = field(default_factory=dict)
     listen_task: asyncio.Task | None = None
 
-    def start(self) -> None:
-        if self.config.use_zmq and has_zmq():
-            self.tokenizer_ingress = make_zmq_push(self.config.zmq_tokenizer_addr, create=False)
-            self.runtime_ingress = make_zmq_push(self.config.zmq_backend_addr, create=False)
-            self.frontend_queue = make_zmq_pull(self.config.zmq_frontend_addr, create=True)
-        if self.tokenizer_process is None:
-            self.tokenizer_process = start_tokenizer_process(
-                self.config.zmq_tokenizer_addr if self.config.use_zmq and has_zmq() else self.tokenizer_ingress,
-                self.config.zmq_backend_addr if self.config.use_zmq and has_zmq() else self.runtime_ingress,
-                self.config.zmq_frontend_addr if self.config.use_zmq and has_zmq() else self.frontend_queue,
-                self.config.tokenizer_name or self.config.model,
-            )
-        if self.runtime_process is None:
-            ack_queue: mp.Queue = mp.Queue()
-            self.runtime_process = start_runtime_process(
-                self.config,
-                self.config.zmq_backend_addr if self.config.use_zmq and has_zmq() else self.runtime_ingress,
-                self.config.zmq_tokenizer_addr if self.config.use_zmq and has_zmq() else self.tokenizer_ingress,
-                ack_queue=ack_queue,
-            )
-            # Block until the runtime signals it is ready (model loaded)
+    def _stop_process(self, process: mp.Process | None, *, name: str) -> bool:
+        if process is None:
+            return True
+        process.join(timeout=1)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        if process.is_alive():
             try:
-                ack_queue.get(timeout=300)
+                process.kill()
             except Exception:
-                pass  # Proceed even if ack times out (e.g. debug/dummy engine)
+                pass
+            process.join(timeout=5)
+        return not process.is_alive()
+
+    def _destroy_zmq_context(self) -> None:
+        try:
+            import zmq
+
+            zmq.Context.instance().destroy(linger=0)
+        except Exception:
+            pass
+
+    def _cleanup_startup_failure(self) -> None:
+        self._stop_process(self.runtime_process, name="runtime")
+        self._stop_process(self.tokenizer_process, name="tokenizer")
+        self.runtime_process = None
+        self.tokenizer_process = None
+        self._destroy_zmq_context()
+
+    def start(self) -> None:
+        ack_queue: mp.Queue | None = None
+        try:
+            if self.config.use_zmq and has_zmq():
+                self.tokenizer_ingress = make_zmq_push(self.config.zmq_tokenizer_addr, create=False)
+                self.runtime_ingress = make_zmq_push(self.config.zmq_backend_addr, create=False)
+                self.frontend_queue = make_zmq_pull(self.config.zmq_frontend_addr, create=True)
+            if self.tokenizer_process is None:
+                self.tokenizer_process = start_tokenizer_process(
+                    self.config.zmq_tokenizer_addr if self.config.use_zmq and has_zmq() else self.tokenizer_ingress,
+                    self.config.zmq_backend_addr if self.config.use_zmq and has_zmq() else self.runtime_ingress,
+                    self.config.zmq_frontend_addr if self.config.use_zmq and has_zmq() else self.frontend_queue,
+                    self.config.tokenizer_name or self.config.model,
+                )
+            if self.runtime_process is None:
+                import time
+
+                ack_queue = mp.Queue()
+                self.runtime_process = start_runtime_process(
+                    self.config,
+                    self.config.zmq_backend_addr if self.config.use_zmq and has_zmq() else self.runtime_ingress,
+                    self.config.zmq_tokenizer_addr if self.config.use_zmq and has_zmq() else self.tokenizer_ingress,
+                    ack_queue=ack_queue,
+                )
+                deadline = time.monotonic() + 300
+                while time.monotonic() < deadline:
+                    if not self.runtime_process.is_alive():
+                        raise RuntimeError(
+                            f"Runtime process exited unexpectedly during startup "
+                            f"(exit code: {self.runtime_process.exitcode}). "
+                            f"Check for port conflicts (--dist-port={self.config.dist_port}) or model load errors."
+                        )
+                    try:
+                        ack_queue.get(timeout=0.5)
+                        return
+                    except Exception:
+                        continue
+                raise RuntimeError(
+                    f"Runtime process did not signal readiness within 300 seconds "
+                    f"(dist-port={self.config.dist_port})."
+                )
+        except Exception:
+            self._cleanup_startup_failure()
+            raise
+        finally:
+            if ack_queue is not None:
+                ack_queue.close()
+                ack_queue.join_thread()
 
     async def start_listener(self) -> None:
         if self.listen_task is None:
@@ -196,16 +249,15 @@ class AppState:
         if self.listen_task is not None:
             self.listen_task.cancel()
             await asyncio.gather(self.listen_task, return_exceptions=True)
-        if self.tokenizer_process is not None:
-            self.tokenizer_process.join(timeout=1)
-        if self.runtime_process is not None:
-            self.runtime_process.join(timeout=1)
-        # Destroy ZMQ context so its I/O threads don't block process exit.
-        try:
-            import zmq
-            zmq.Context.instance().destroy(linger=0)
-        except Exception:
-            pass
+        tokenizer_stopped = self._stop_process(self.tokenizer_process, name="tokenizer")
+        runtime_stopped = self._stop_process(self.runtime_process, name="runtime")
+        self.tokenizer_process = None
+        self.runtime_process = None
+        self._destroy_zmq_context()
+        if not tokenizer_stopped or not runtime_stopped:
+            print(
+                "Warning: forced shutdown was required for one or more worker processes."
+            )
 
 
 def _flatten_prompt(request: ChatCompletionRequest) -> str:

@@ -28,6 +28,8 @@ class ServerConfig:
     default_max_tokens: int = 64
     tokenizer_name: str | None = None
     device: str = "auto"
+    tp_size: int = 1
+    dist_port: int = 29500
     use_zmq: bool = True
     stop_token_ids: tuple[int, ...] = field(default_factory=tuple)
     _unique_suffix: str = field(default_factory=lambda: f".pid={os.getpid()}")
@@ -61,13 +63,14 @@ def server_config_to_scheduler_config(cfg: ServerConfig):
 
     return SchedulerConfig(
         model_path=cfg.model,
-        tp_info=DistributedInfo(rank=0, size=1),
+        tp_info=DistributedInfo(rank=0, size=cfg.tp_size),
         dtype=torch.float16,
         page_size=cfg.page_size,
         max_running_req=cfg.max_running_requests,
         num_page_override=cfg.total_pages,
         max_extend_tokens=cfg.max_prefill_tokens,
         use_dummy_weight=use_dummy,
+        dist_port=cfg.dist_port,
         _unique_suffix=cfg._unique_suffix,
         # SchedulerRuntime handles all I/O itself (queue.Queue bridging); the
         # Scheduler it wraps must run in offline mode so SchedulerIOMixin does

@@ -24,6 +24,7 @@ class EngineConfig:
     page_size: int = 1
     memory_ratio: float = 0.9
     distributed_timeout: float = 60.0
+    dist_port: int = 29500
     use_dummy_weight: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
@@ -53,4 +54,4 @@ class EngineConfig:
 
     @property
     def distributed_addr(self) -> str:
-        return "tcp://127.0.0.1:29500"
+        return f"tcp://127.0.0.1:{self.dist_port}"
