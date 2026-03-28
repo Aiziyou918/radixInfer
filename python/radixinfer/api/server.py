@@ -103,6 +103,7 @@ class AppState:
     listen_task: asyncio.Task | None = None
     inline_runtime: SchedulerRuntime | None = None
     inline_tokenizer: Any | None = None
+    inline_detok_manager: Any | None = None  # DetokenizeManager for inline mode
     inline_tasks: set[asyncio.Task] = field(default_factory=set)
     # Shared completion set: whichever pump call consumes the finished chunk writes
     # request_id here so _run_inline_request() can always see it.
@@ -114,7 +115,10 @@ class AppState:
 
     def start(self) -> None:
         if self.inline_mode:
+            from radixinfer.transport.detokenize import DetokenizeManager
+
             self.inline_tokenizer = create_tokenizer_backend(self.config.tokenizer_name or self.config.model)
+            self.inline_detok_manager = DetokenizeManager(self.inline_tokenizer)
             self.inline_runtime = SchedulerRuntime(
                 self.config,
                 self.runtime_ingress,
@@ -133,11 +137,18 @@ class AppState:
                 self.config.tokenizer_name or self.config.model,
             )
         if self.runtime_process is None:
+            ack_queue: mp.Queue = mp.Queue()
             self.runtime_process = start_runtime_process(
                 self.config,
                 self.config.zmq_backend_addr if self.config.use_zmq and has_zmq() else self.runtime_ingress,
                 self.config.zmq_tokenizer_addr if self.config.use_zmq and has_zmq() else self.tokenizer_ingress,
+                ack_queue=ack_queue,
             )
+            # Block until the runtime signals it is ready (model loaded)
+            try:
+                ack_queue.get(timeout=300)
+            except Exception:
+                pass  # Proceed even if ack times out (e.g. debug/dummy engine)
 
     async def start_listener(self) -> None:
         if self.inline_mode:
@@ -162,9 +173,17 @@ class AppState:
         self.request_counter += 1
         return current
 
-    def submit_request(self, request_id: int, prompt: str, sampling: SamplingParams) -> None:
+    def submit_request(
+        self,
+        request_id: int,
+        prompt: str,
+        sampling: SamplingParams,
+        messages: list | None = None,
+    ) -> None:
         if self.inline_mode:
-            task = asyncio.create_task(self._run_inline_request(request_id, prompt, sampling))
+            task = asyncio.create_task(
+                self._run_inline_request(request_id, prompt, sampling, messages=messages)
+            )
             self.inline_tasks.add(task)
             task.add_done_callback(self.inline_tasks.discard)
             return
@@ -173,6 +192,7 @@ class AppState:
                 request_id=request_id,
                 prompt=prompt,
                 sampling=sampling,
+                messages=messages,
             )
         )
 
@@ -187,13 +207,18 @@ class AppState:
         request_id: int,
         prompt: str,
         sampling: SamplingParams,
+        messages: list | None = None,
     ) -> None:
         assert self.inline_runtime is not None
         assert self.inline_tokenizer is not None
+        if messages is not None and hasattr(self.inline_tokenizer, "encode_messages"):
+            token_ids = self.inline_tokenizer.encode_messages(messages)
+        else:
+            token_ids = self.inline_tokenizer.encode(prompt)
         self.runtime_ingress.put(
             TokenizedRequest(
                 request_id=request_id,
-                token_ids=self.inline_tokenizer.encode(prompt),
+                token_ids=token_ids,
                 sampling=sampling,
                 eos_token_id=getattr(self.inline_tokenizer, "eos_token_id", None),
                 stop_token_ids=getattr(self.inline_tokenizer, "stop_token_ids", ()),
@@ -215,8 +240,12 @@ class AppState:
     async def _pump_inline_runtime(self) -> None:
         assert self.inline_runtime is not None
         assert self.inline_tokenizer is not None
+        assert self.inline_detok_manager is not None
         self.inline_runtime._drain_ingress()
         self.inline_runtime._tick()
+
+        # Collect all pending DetokenizeRequests
+        pending_detok = []
         while True:
             try:
                 detok = self.tokenizer_ingress.get_nowait()
@@ -224,10 +253,18 @@ class AppState:
                 break
             if detok is None:
                 continue
+            pending_detok.append(detok)
+
+        if not pending_detok:
+            return
+
+        # Batch-incremental detokenize
+        texts = self.inline_detok_manager.detokenize(pending_detok)
+        for detok, text in zip(pending_detok, texts):
             chunk = StreamChunk(
                 request_id=detok.request_id,
                 token_id=detok.token_id,
-                text=self.inline_tokenizer.decode_token(detok.token_id) if detok.emit_text else "",
+                text=text,
                 finished=detok.finished,
                 finish_reason=detok.finish_reason,
                 prompt_tokens=detok.prompt_tokens,
@@ -636,6 +673,13 @@ def create_app(config: ServerConfig) -> FastAPI:
         created = int(time.time())
         output_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
         state.listeners[request_id] = output_queue
+        # Pass messages list so the tokenizer worker can apply the chat template.
+        # Fall back to flattened prompt if messages is not provided.
+        chat_messages = (
+            [{"role": m.role, "content": m.content} for m in payload.messages]
+            if payload.messages
+            else None
+        )
         state.submit_request(
             request_id,
             _flatten_prompt(payload),
@@ -650,6 +694,7 @@ def create_app(config: ServerConfig) -> FastAPI:
                 presence_penalty=payload.presence_penalty,
                 frequency_penalty=payload.frequency_penalty,
             ),
+            messages=chat_messages,
         )
 
         if not payload.stream:

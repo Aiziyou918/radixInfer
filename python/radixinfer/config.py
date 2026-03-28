@@ -70,4 +70,8 @@ def server_config_to_scheduler_config(cfg: ServerConfig):
         max_extend_tokens=cfg.max_prefill_tokens,
         use_dummy_weight=use_dummy,
         _unique_suffix=cfg._unique_suffix,
+        # SchedulerRuntime handles all I/O itself (queue.Queue bridging); the
+        # Scheduler it wraps must run in offline mode so SchedulerIOMixin does
+        # not try to bind ZMQ sockets that SchedulerRuntime already owns.
+        offline_mode=True,
     )
