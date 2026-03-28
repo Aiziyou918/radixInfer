@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from radixinfer.engine.base import RequestTableState
+from radixinfer.engine.base import RequestPagedAttentionState, RequestTableState
 
 
 @dataclass
@@ -54,4 +54,33 @@ class TableManager:
             write_position=write_position,
             page_ids=tuple(self.page_table[slot][:token_count]),
             token_ids=tuple(self.token_table[slot][:token_count]),
+        )
+
+    def paged_attention_state(
+        self,
+        slot: int,
+        token_count: int,
+        write_position: int,
+    ) -> RequestPagedAttentionState:
+        page_ids = tuple(
+            page_id
+            for page_id in self.page_table[slot][:token_count]
+            if page_id is not None
+        )
+        unique_page_ids: list[int] = []
+        seen: set[int] = set()
+        for page_id in page_ids:
+            if page_id in seen:
+                continue
+            seen.add(page_id)
+            unique_page_ids.append(page_id)
+        page_count = len(unique_page_ids)
+        return RequestPagedAttentionState(
+            table_slot=slot,
+            token_count=token_count,
+            write_position=write_position,
+            page_ids=tuple(unique_page_ids),
+            page_indices=tuple(range(page_count)),
+            kv_page_indices=tuple(range(page_count)),
+            last_page_len=0 if token_count == 0 else ((token_count - 1) % self.page_size) + 1,
         )

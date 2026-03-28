@@ -16,6 +16,17 @@ class RequestTableState:
 
 
 @dataclass(frozen=True)
+class RequestPagedAttentionState:
+    table_slot: int
+    token_count: int
+    write_position: int
+    page_ids: tuple[int, ...] = field(default_factory=tuple)
+    page_indices: tuple[int, ...] = field(default_factory=tuple)
+    kv_page_indices: tuple[int, ...] = field(default_factory=tuple)
+    last_page_len: int = 0
+
+
+@dataclass(frozen=True)
 class MaterializedBatchMetadata:
     positions: tuple[int, ...] = field(default_factory=tuple)
     input_table_slots: tuple[int, ...] = field(default_factory=tuple)
@@ -24,6 +35,7 @@ class MaterializedBatchMetadata:
     write_positions: tuple[int, ...] = field(default_factory=tuple)
     request_token_counts: tuple[int, ...] = field(default_factory=tuple)
     request_table_states: tuple[RequestTableState, ...] = field(default_factory=tuple)
+    request_paged_states: tuple[RequestPagedAttentionState, ...] = field(default_factory=tuple)
 
     def request_slice(self, index: int) -> slice:
         start = sum(self.request_token_counts[:index])
@@ -40,6 +52,7 @@ class MaterializedBatchMetadata:
             write_positions=self.write_positions[index : index + 1],
             request_token_counts=self.request_token_counts[index : index + 1],
             request_table_states=self.request_table_states[index : index + 1],
+            request_paged_states=self.request_paged_states[index : index + 1],
         )
 
 

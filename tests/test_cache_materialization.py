@@ -197,6 +197,13 @@ def test_executor_prepares_decode_metadata() -> None:
     assert prepared.metadata.request_table_states[0].write_position == 4
     assert prepared.metadata.request_table_states[0].page_ids == (0, 0, 1, 1)
     assert prepared.metadata.request_table_states[0].token_ids == (21, 22, 23, 24)
+    assert prepared.metadata.request_paged_states[0].table_slot == req.table_slot
+    assert prepared.metadata.request_paged_states[0].token_count == 4
+    assert prepared.metadata.request_paged_states[0].write_position == 4
+    assert prepared.metadata.request_paged_states[0].page_ids == (0, 1)
+    assert prepared.metadata.request_paged_states[0].page_indices == (0, 1)
+    assert prepared.metadata.request_paged_states[0].kv_page_indices == (0, 1)
+    assert prepared.metadata.request_paged_states[0].last_page_len == 2
 
 
 def test_executor_prepares_prefill_metadata() -> None:
@@ -236,6 +243,8 @@ def test_executor_prepares_prefill_metadata() -> None:
     assert prepared.metadata.request_table_states[0].write_position == 4
     assert prepared.metadata.request_table_states[0].page_ids == (0, 0)
     assert prepared.metadata.request_table_states[0].token_ids == (31, 32)
+    assert prepared.metadata.request_paged_states[0].page_ids == (0,)
+    assert prepared.metadata.request_paged_states[0].last_page_len == 2
 
 
 def test_executor_flattens_multi_request_prefill_metadata() -> None:
@@ -290,6 +299,8 @@ def test_executor_flattens_multi_request_prefill_metadata() -> None:
     assert prepared.metadata.request_view(1).positions == (2, 3)
     assert prepared.metadata.request_view(0).request_table_states[0].token_ids == ()
     assert prepared.metadata.request_view(1).request_table_states[0].token_ids == (51, 52)
+    assert prepared.metadata.request_view(0).request_paged_states[0].page_ids == ()
+    assert prepared.metadata.request_view(1).request_paged_states[0].page_ids == (3,)
 
 
 def test_prefill_writes_real_kv_into_page_pool_for_hf_debug_engine() -> None:

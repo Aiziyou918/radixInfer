@@ -8,17 +8,19 @@ from transformers.cache_utils import DynamicCache
 
 from radixinfer.cache.page_pool import KVCacheView
 
-from .base import AttentionCacheWrite, MaterializedBatchMetadata, RequestTableState
+from .base import AttentionCacheWrite, MaterializedBatchMetadata, RequestPagedAttentionState
 
 
 @dataclass(frozen=True)
 class PagedAttentionPlan:
     table_slot: int
     page_ids: tuple[int | None, ...]
-    token_ids: tuple[int | None, ...]
     token_count: int
     write_position: int
     page_size: int
+    page_indices: tuple[int, ...]
+    kv_page_indices: tuple[int, ...]
+    last_page_len: int
 
     @property
     def page_count(self) -> int:
@@ -84,20 +86,21 @@ class PagedAttentionBackend(AttentionBackend):
         self,
         metadata: MaterializedBatchMetadata | None,
     ) -> PagedAttentionPlan | None:
-        if metadata is None or not metadata.request_table_states:
+        if metadata is None or not metadata.request_paged_states:
             return None
-        state = metadata.request_table_states[0]
+        state = metadata.request_paged_states[0]
         return self._plan_from_state(state)
 
-    def _plan_from_state(self, state: RequestTableState) -> PagedAttentionPlan:
-        page_count = (state.token_count + self.page_size - 1) // self.page_size
+    def _plan_from_state(self, state: RequestPagedAttentionState) -> PagedAttentionPlan:
         return PagedAttentionPlan(
             table_slot=state.table_slot,
-            page_ids=tuple(state.page_ids[:page_count]),
-            token_ids=tuple(token_id for token_id in state.token_ids[: state.token_count] if token_id is not None),
+            page_ids=state.page_ids,
             token_count=state.token_count,
             write_position=state.write_position,
             page_size=self.page_size,
+            page_indices=state.page_indices,
+            kv_page_indices=state.kv_page_indices,
+            last_page_len=state.last_page_len,
         )
 
 

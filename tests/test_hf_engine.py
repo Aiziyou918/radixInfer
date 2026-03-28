@@ -1,6 +1,11 @@
 import torch
 
-from radixinfer.engine.base import DecodeInput, MaterializedBatchMetadata, RequestTableState
+from radixinfer.engine.base import (
+    DecodeInput,
+    MaterializedBatchMetadata,
+    RequestPagedAttentionState,
+    RequestTableState,
+)
 from radixinfer.engine.attention import HuggingFaceFallbackAttentionBackend, PagedAttentionBackend
 from radixinfer.engine.hf import HuggingFaceEngine
 
@@ -34,14 +39,27 @@ def test_paged_attention_backend_builds_paged_plan_from_request_table_state() ->
                 token_ids=(21, 22, 23),
             ),
         ),
+        request_paged_states=(
+            RequestPagedAttentionState(
+                table_slot=5,
+                token_count=3,
+                write_position=4,
+                page_ids=(8,),
+                page_indices=(0,),
+                kv_page_indices=(0,),
+                last_page_len=3,
+            ),
+        ),
     )
     prepared = backend.prepare_batch(token_ids=[[23, 24]], kv_caches=[None], metadata=metadata)
     assert prepared[0].paged_plan is not None
     assert prepared[0].paged_plan.table_slot == 5
     assert prepared[0].paged_plan.page_ids == (8,)
-    assert prepared[0].paged_plan.token_ids == (21, 22, 23)
     assert prepared[0].paged_plan.token_count == 3
     assert prepared[0].paged_plan.write_position == 4
+    assert prepared[0].paged_plan.page_indices == (0,)
+    assert prepared[0].paged_plan.kv_page_indices == (0,)
+    assert prepared[0].paged_plan.last_page_len == 3
 
 
 def test_hf_fallback_attention_backend_uses_paged_plan() -> None:
@@ -69,8 +87,20 @@ def test_hf_fallback_attention_backend_uses_paged_plan() -> None:
                 token_ids=(21, 22, 23),
             ),
         ),
+        request_paged_states=(
+            RequestPagedAttentionState(
+                table_slot=5,
+                token_count=3,
+                write_position=3,
+                page_ids=(8,),
+                page_indices=(0,),
+                kv_page_indices=(0,),
+                last_page_len=3,
+            ),
+        ),
     )
     prepared = backend.prepare_batch(token_ids=[[24]], kv_caches=[None], metadata=metadata)
     assert prepared[0].paged_plan is not None
     assert prepared[0].paged_plan.page_ids == (8,)
+    assert prepared[0].paged_plan.kv_page_indices == (0,)
     assert prepared[0].input_ids.device.type == "cpu"

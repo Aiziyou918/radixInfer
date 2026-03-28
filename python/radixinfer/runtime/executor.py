@@ -62,6 +62,9 @@ class Executor:
         self.table_manager.append_token(request.table_slot, position, page_id, token_id)
 
     def prepare_prefill_batch(self, requests: list[RuntimeRequest]) -> PreparedPrefillBatch:
+        for req in requests:
+            if req.table_slot is not None and req.cache_span is not None and req.cached_token_count > 0:
+                self.materialize_request(req)
         metadata = self._build_prefill_metadata(requests)
         token_ids = [
             req.prompt_tokens[req.prefix_matched : req.prefix_matched + req.prefill_cursor]
@@ -86,6 +89,9 @@ class Executor:
         )
 
     def prepare_decode_batch(self, requests: list[RuntimeRequest]) -> PreparedDecodeBatch:
+        for req in requests:
+            if req.table_slot is not None and req.cache_span is not None and req.cached_token_count > 0:
+                self.materialize_request(req)
         metadata = self._build_decode_metadata(requests)
         return PreparedDecodeBatch(
             decode_input=DecodeInput(
@@ -131,6 +137,15 @@ class Executor:
                 for req in requests
                 if req.table_slot is not None
             ),
+            request_paged_states=tuple(
+                self.table_manager.paged_attention_state(
+                    req.table_slot,
+                    token_count=req.prefix_matched,
+                    write_position=req.prefix_matched + req.prefill_cursor,
+                )
+                for req in requests
+                if req.table_slot is not None
+            ),
         )
 
     def _build_decode_metadata(self, requests: list[RuntimeRequest]) -> MaterializedBatchMetadata:
@@ -154,6 +169,15 @@ class Executor:
             request_token_counts=tuple(buffer.request_token_counts),
             request_table_states=tuple(
                 self.table_manager.request_state(
+                    req.table_slot,
+                    token_count=req.cached_token_count,
+                    write_position=req.cached_token_count,
+                )
+                for req in requests
+                if req.table_slot is not None
+            ),
+            request_paged_states=tuple(
+                self.table_manager.paged_attention_state(
                     req.table_slot,
                     token_count=req.cached_token_count,
                     write_position=req.cached_token_count,
