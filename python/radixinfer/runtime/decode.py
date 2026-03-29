@@ -34,7 +34,13 @@ class DecodeManager:
     def schedule_next_batch(self) -> Batch | None:
         if not self.runnable:
             return None
-        return Batch(reqs=list(self.running_reqs), phase="decode")
+        # Sort by uid for deterministic ordering across TP ranks.
+        # running_reqs is a set; without sorting, list() produces different
+        # orderings on rank 0 and rank 1 (different Python object ids), causing
+        # token positions to diverge, allreduce to mix incompatible tensors, and
+        # eventually NCCL seqnum desync under sustained load.
+        reqs = sorted(self.running_reqs, key=lambda r: r.uid)
+        return Batch(reqs=reqs, phase="decode")
 
     @property
     def runnable(self) -> bool:

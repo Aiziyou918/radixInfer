@@ -253,10 +253,23 @@ class AppState:
             self.listen_task.cancel()
             await asyncio.gather(self.listen_task, return_exceptions=True)
         tokenizer_stopped = self._stop_process(self.tokenizer_process, name="tokenizer")
-        runtime_stopped = all(
-            self._stop_process(p, name=f"runtime-{i}")
-            for i, p in enumerate(self.runtime_processes)
-        )
+        # Wait for all runtime processes together so TP ranks can reach sync_all_ranks()
+        # simultaneously and coordinate destroy_process_group() cleanly.
+        deadline = time.monotonic() + 30
+        for p in self.runtime_processes:
+            remaining = max(0.1, deadline - time.monotonic())
+            p.join(timeout=remaining)
+        for i, p in enumerate(self.runtime_processes):
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
+            if p.is_alive():
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                p.join(timeout=5)
+        runtime_stopped = all(not p.is_alive() for p in self.runtime_processes)
         self.tokenizer_process = None
         self.runtime_processes = []
         self._destroy_zmq_context()

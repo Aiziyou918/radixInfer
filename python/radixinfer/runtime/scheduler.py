@@ -149,6 +149,8 @@ class Scheduler(SchedulerIOMixin):
     def _drain_input_queue(self, blocking: bool) -> None:
         msgs = self.receive_msg(blocking=blocking)
         for msg in msgs:
+            if msg is None:
+                raise SystemExit(0)
             self._process_new_req(msg)
 
     def _process_new_req(self, req) -> None:
@@ -250,6 +252,7 @@ class Scheduler(SchedulerIOMixin):
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
+        self.sync_all_ranks()
         self.engine.shutdown()
 
 
@@ -368,16 +371,24 @@ def _run_scheduler_process(
 
     runtime = SchedulerRuntime(config, runtime_ingress, output_queue, rank=rank)
 
-    # Signal to the parent process that initialisation (model loading) is done.
-    # For TP>1 this happens after torch.distributed.init_process_group which
-    # requires all ranks to be running, so rank 0's ack implicitly confirms
-    # all ranks are alive.
+    # Mirror mini-sglang: CPU-side barrier so all ranks finish ZMQ socket setup
+    # before rank 0 signals readiness to the parent process.
+    # Without this, rank 0 may start publishing messages before rank 1's
+    # ZMQ sub socket has connected, silently dropping the first messages.
+    runtime._impl.sync_all_ranks()
+
     if ack_queue is not None:
         try:
             ack_queue.put("Scheduler is ready")
         except Exception:
             pass
-    runtime.run_forever()
+
+    try:
+        runtime.run_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        runtime._impl.shutdown()
 
 
 def start_runtime_process(

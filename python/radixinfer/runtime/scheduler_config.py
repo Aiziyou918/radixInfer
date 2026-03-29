@@ -47,4 +47,8 @@ class SchedulerConfig(EngineConfig):
 
     @property
     def backend_create_detokenizer_link(self) -> bool:
-        return True
+        # radixInfer uses a combined tokenizer+detokenizer worker that BINDs on
+        # zmq_detokenizer_addr (== zmq_tokenizer_addr).  The scheduler must
+        # CONNECT (create=False) rather than BIND to avoid stealing the IPC
+        # socket file from the tokenizer worker.
+        return False
