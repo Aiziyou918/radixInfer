@@ -1,7 +1,5 @@
 from .page_pool import PagePool, PageReservation
 from .prefix_store import (
-    PrefixStore,
-    PrefixHit,
     RadixPrefixCache,
     RadixCacheHandle,
     BasePrefixCache,
@@ -13,8 +11,6 @@ from .prefix_store import (
 __all__ = [
     "PagePool",
     "PageReservation",
-    "PrefixStore",
-    "PrefixHit",
     "RadixPrefixCache",
     "RadixCacheHandle",
     "BasePrefixCache",

@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from radixinfer.cache.page_pool import PageReservation, PageSpan
-from radixinfer.cache.prefix_store import PrefixCacheKey
 from radixinfer.transport.protocol import SamplingParams
 
 
@@ -28,7 +27,6 @@ class RuntimeRequest:
     generated_tokens: list[int] = field(default_factory=list)
     prefix_matched: int = 0
     prefix_span: PageSpan | None = None
-    prefix_cache_key: PrefixCacheKey | None = None
     cache_span: PageSpan | None = None
     prefill_cursor: int = 0
     age: int = 0

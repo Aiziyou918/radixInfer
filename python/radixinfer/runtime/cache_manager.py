@@ -158,12 +158,5 @@ def _write_page_table(
 
 
 def _create_prefix_cache(device: torch.device, cache_type: str):
-    """Create a prefix cache instance (radix or fallback)."""
-    try:
-        from radixinfer.cache.prefix_store import RadixPrefixCache
-
-        return RadixPrefixCache(device=device)
-    except ImportError:
-        from radixinfer.cache.prefix_store import PrefixStore
-
-        return PrefixStore(device=device)
+    from radixinfer.cache.prefix_store import RadixPrefixCache
+    return RadixPrefixCache(device=device)
