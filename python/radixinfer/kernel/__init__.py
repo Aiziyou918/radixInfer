@@ -68,7 +68,7 @@ def indexing(
             return F.embedding(indices, weights)
         start, size = vocab_range
         mask = (indices >= start) & (indices < start + size)
-        local_idx = (indices - start).clamp(min=0)
+        local_idx = (indices - start).clamp(min=0, max=size - 1)
         y = F.embedding(local_idx, weights)
         return y * mask.unsqueeze(-1).to(y.dtype)
 

@@ -39,8 +39,11 @@ class VocabParallelEmbedding(BaseOP):
         except ImportError:
             # fallback when kernel extension is not compiled
             if self.tp_size > 1:
-                mask = (x >= self.vocab_range[0]) & (x < self.vocab_range[0] + self.vocab_range[1])
-                local_x = (x - self.vocab_range[0]).clamp(min=0)
+                start, local_vocab_size = self.vocab_range
+                if local_vocab_size <= 0:
+                    return x.new_zeros((*x.shape, self.weight.shape[1]), dtype=self.weight.dtype)
+                mask = (x >= start) & (x < start + local_vocab_size)
+                local_x = (x - start).clamp(min=0, max=local_vocab_size - 1)
                 y = F.embedding(local_x, self.weight) * mask.unsqueeze(-1).to(self.weight.dtype)
             else:
                 y = F.embedding(x, self.weight)
