@@ -35,7 +35,7 @@ class SchedulerConfig(EngineConfig):
 
     @property
     def zmq_detokenizer_addr(self) -> str:
-        return "ipc:///tmp/radixinfer_1" + self._unique_suffix
+        return "ipc:///tmp/radixinfer_3" + self._unique_suffix
 
     @property
     def zmq_scheduler_broadcast_addr(self) -> str:

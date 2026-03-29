@@ -96,7 +96,7 @@ class AppState:
     frontend_queue: Any = field(default_factory=mp.Queue)
     request_counter: int = 0
     tokenizer_process: mp.Process | None = None
-    runtime_process: mp.Process | None = None
+    runtime_processes: list = field(default_factory=list)
     listeners: dict[int, asyncio.Queue[StreamChunk]] = field(default_factory=dict)
     listen_task: asyncio.Task | None = None
 
@@ -124,9 +124,10 @@ class AppState:
             pass
 
     def _cleanup_startup_failure(self) -> None:
-        self._stop_process(self.runtime_process, name="runtime")
+        for p in self.runtime_processes:
+            self._stop_process(p, name="runtime")
         self._stop_process(self.tokenizer_process, name="tokenizer")
-        self.runtime_process = None
+        self.runtime_processes = []
         self.tokenizer_process = None
         self._destroy_zmq_context()
 
@@ -144,11 +145,11 @@ class AppState:
                     self.config.zmq_frontend_addr if self.config.use_zmq and has_zmq() else self.frontend_queue,
                     self.config.tokenizer_name or self.config.model,
                 )
-            if self.runtime_process is None:
+            if not self.runtime_processes:
                 import time
 
                 ack_queue = mp.Queue()
-                self.runtime_process = start_runtime_process(
+                self.runtime_processes = start_runtime_process(
                     self.config,
                     self.config.zmq_backend_addr if self.config.use_zmq and has_zmq() else self.runtime_ingress,
                     self.config.zmq_tokenizer_addr if self.config.use_zmq and has_zmq() else self.tokenizer_ingress,
@@ -156,10 +157,12 @@ class AppState:
                 )
                 deadline = time.monotonic() + 300
                 while time.monotonic() < deadline:
-                    if not self.runtime_process.is_alive():
+                    dead = [p for p in self.runtime_processes if not p.is_alive()]
+                    if dead:
+                        codes = [p.exitcode for p in dead]
                         raise RuntimeError(
-                            f"Runtime process exited unexpectedly during startup "
-                            f"(exit code: {self.runtime_process.exitcode}). "
+                            f"Runtime process(es) exited unexpectedly during startup "
+                            f"(exit codes: {codes}). "
                             f"Check for port conflicts (--dist-port={self.config.dist_port}) or model load errors."
                         )
                     try:
@@ -250,9 +253,12 @@ class AppState:
             self.listen_task.cancel()
             await asyncio.gather(self.listen_task, return_exceptions=True)
         tokenizer_stopped = self._stop_process(self.tokenizer_process, name="tokenizer")
-        runtime_stopped = self._stop_process(self.runtime_process, name="runtime")
+        runtime_stopped = all(
+            self._stop_process(p, name=f"runtime-{i}")
+            for i, p in enumerate(self.runtime_processes)
+        )
         self.tokenizer_process = None
-        self.runtime_process = None
+        self.runtime_processes = []
         self._destroy_zmq_context()
         if not tokenizer_stopped or not runtime_stopped:
             print(

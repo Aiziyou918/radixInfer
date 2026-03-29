@@ -74,7 +74,7 @@ class Scheduler(SchedulerIOMixin):
         self.eos_token_id: int = 0
 
         # Set up I/O via mixin (ZMQ for production, queue.Queue for offline/tests)
-        SchedulerIOMixin.__init__(self, config, tp_cpu_group=tp_cpu_group)
+        SchedulerIOMixin.__init__(self, config, tp_cpu_group=tp_cpu_group or engine.tp_cpu_group)
 
     def enqueue(self, request) -> None:
         """Put a tokenized request into the offline input queue (offline mode only)."""
@@ -304,21 +304,27 @@ def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
 class SchedulerRuntime:
     """Wraps Scheduler and bridges external queue I/O for api/server.py.
 
-    Multiprocess mode: run_forever() blocks in a subprocess.
+    TP=1 (offline mode): _drain_ingress() bridges external ingress to the
+    scheduler's internal queue.Queue.
+    TP>1 (online ZMQ mode): scheduler manages its own ZMQ I/O and is called
+    via run_forever() directly.
     """
 
-    def __init__(self, config: Any, runtime_ingress: Any, output_queue: Any) -> None:
+    def __init__(self, config: Any, runtime_ingress: Any, output_queue: Any, rank: int = 0) -> None:
         from radixinfer.config import server_config_to_scheduler_config
 
+        tp_size = getattr(config, "tp_size", 1)
+        self._is_offline = (tp_size == 1)
         self._ingress = runtime_ingress
 
-        sched_cfg = server_config_to_scheduler_config(config)
+        sched_cfg = server_config_to_scheduler_config(config, rank=rank)
         sched = Scheduler(sched_cfg)
-        sched._out_queue = output_queue
+        if self._is_offline:
+            sched._out_queue = output_queue
         self._impl = sched
 
     def _drain_ingress(self) -> None:
-        """Read all pending items from runtime_ingress into the scheduler."""
+        """Read all pending items from runtime_ingress into the scheduler (offline/TP=1 only)."""
         while True:
             try:
                 req = self._ingress.get_nowait()
@@ -330,17 +336,16 @@ class SchedulerRuntime:
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
-        """Blocking loop — intended for subprocess use.
-
-        The entire loop runs inside engine_stream_ctx so that every
-        normal_loop() → forward_batch() call sees
-        torch.cuda.current_stream() == engine.stream.
-        """
-        with self._impl.engine_stream_ctx:
-            self._impl.engine.stream.wait_stream(self._impl.stream)
-            while True:
-                self._drain_ingress()
-                self._impl.normal_loop()
+        if self._is_offline:
+            # TP=1: manual bridge from external ingress to scheduler's _in_queue
+            with self._impl.engine_stream_ctx:
+                self._impl.engine.stream.wait_stream(self._impl.stream)
+                while True:
+                    self._drain_ingress()
+                    self._impl.normal_loop()
+        else:
+            # TP>1: scheduler manages its own ZMQ I/O
+            self._impl.run_forever()
 
 
 def _run_scheduler_process(
@@ -348,14 +353,25 @@ def _run_scheduler_process(
     runtime_ingress: Any,
     output_queue: Any,
     ack_queue: Any = None,
+    rank: int = 0,
 ) -> None:
     """Entry point for the runtime subprocess."""
-    if isinstance(runtime_ingress, str):
-        runtime_ingress = make_zmq_pull(runtime_ingress, create=True)
-    if isinstance(output_queue, str):
-        output_queue = make_zmq_push(output_queue, create=False)
-    runtime = SchedulerRuntime(config, runtime_ingress, output_queue)
-    # Signal to the parent process that initialisation (model loading) is done
+    tp_size = getattr(config, "tp_size", 1)
+    is_offline = (tp_size == 1)
+
+    if is_offline:
+        # TP=1: create ZMQ sockets if addresses given as strings
+        if isinstance(runtime_ingress, str):
+            runtime_ingress = make_zmq_pull(runtime_ingress, create=True)
+        if isinstance(output_queue, str):
+            output_queue = make_zmq_push(output_queue, create=False)
+
+    runtime = SchedulerRuntime(config, runtime_ingress, output_queue, rank=rank)
+
+    # Signal to the parent process that initialisation (model loading) is done.
+    # For TP>1 this happens after torch.distributed.init_process_group which
+    # requires all ranks to be running, so rank 0's ack implicitly confirms
+    # all ranks are alive.
     if ack_queue is not None:
         try:
             ack_queue.put("Scheduler is ready")
@@ -370,13 +386,22 @@ def start_runtime_process(
     output_queue: Any,
     *,
     ack_queue: Any = None,
-) -> mp.Process:
-    """Spawn a daemon subprocess running the Scheduler loop."""
-    process = mp.Process(
-        target=_run_scheduler_process,
-        args=(config, runtime_ingress, output_queue, ack_queue),
-        name="radixinfer-runtime",
-        daemon=True,
-    )
-    process.start()
-    return process
+) -> list:
+    """Spawn daemon subprocesses running the Scheduler loop.
+
+    Returns a list of mp.Process objects (one per TP rank).
+    Only rank 0 receives ack_queue; its ack implies all ranks have completed
+    torch.distributed.init_process_group.
+    """
+    tp_size = getattr(config, "tp_size", 1)
+    processes = []
+    for rank in range(tp_size):
+        process = mp.Process(
+            target=_run_scheduler_process,
+            args=(config, runtime_ingress, output_queue, ack_queue if rank == 0 else None, rank),
+            name=f"radixinfer-runtime-{rank}",
+            daemon=True,
+        )
+        process.start()
+        processes.append(process)
+    return processes
