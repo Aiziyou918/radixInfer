@@ -163,3 +163,33 @@ def ZmqPubQueue(addr: str, *, create: bool = True, encoder=None):
 
 def ZmqSubQueue(addr: str, *, create: bool = False, decoder=None):
     return _make_queue(addr, create=create, decoder=decoder, socket_type="sub")
+
+
+class _ZmqAsyncPullQueue(Generic[T]):
+    """Async ZMQ PULL queue — `await get()` suspends until a message arrives."""
+
+    def __init__(self, socket, *, decoder: Callable):
+        self._sock = socket
+        self._decoder = decoder
+
+    async def get(self) -> T:
+        raw = await self._sock.recv()
+        return self._decoder(raw)
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+def ZmqAsyncPullQueue(addr: str, *, create: bool = True, decoder=None):
+    """Async ZMQ PULL bound/connected to *addr*. Requires zmq."""
+    import zmq
+    import zmq.asyncio
+
+    ctx = zmq.asyncio.Context()
+    sock = ctx.socket(zmq.PULL)
+    sock.setsockopt(zmq.LINGER, 0)
+    if create:
+        sock.bind(addr)
+    else:
+        sock.connect(addr)
+    return _ZmqAsyncPullQueue(sock, decoder=decoder or pickle_decode)

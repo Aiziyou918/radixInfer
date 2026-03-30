@@ -70,6 +70,12 @@ class BatchDetokenizeRequest:
 
 
 @dataclass(frozen=True)
+class BatchStreamChunk:
+    """Wraps multiple StreamChunks for efficient batch transport over ZMQ."""
+    chunks: list[StreamChunk]
+
+
+@dataclass(frozen=True)
 class EngineStep:
     request_ids: list[int] = field(default_factory=list)
     token_ids: list[int] = field(default_factory=list)

@@ -69,3 +69,14 @@ def make_zmq_sub(addr: str, *, create: bool = False, decoder=None):
     from radixinfer.utils.mp import ZmqSubQueue, pickle_decode
 
     return ZmqSubQueue(addr, create=create, decoder=decoder or pickle_decode)
+
+
+def make_zmq_async_pull(addr: str, *, create: bool = True, decoder=None):
+    """Return an async PULL queue bound/connected to *addr*.
+
+    The returned object exposes ``async def get() -> T`` which suspends
+    the asyncio event loop until a message arrives — no polling needed.
+    """
+    from radixinfer.utils.mp import ZmqAsyncPullQueue, pickle_decode
+
+    return ZmqAsyncPullQueue(addr, create=create, decoder=decoder or pickle_decode)

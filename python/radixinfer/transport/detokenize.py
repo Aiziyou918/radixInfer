@@ -84,7 +84,13 @@ class DetokenizeManager:
 
         incremental_strs: List[str] = []
         for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
-            s = self.decode_map[msg.request_id]
+            s = self.decode_map.get(msg.request_id)
+            if s is None:
+                # Duplicate finished message (overlap scheduling can emit the same
+                # request_id in two consecutive batches; the first finished=True
+                # already cleaned up this entry — safely skip the stale duplicate).
+                incremental_strs.append("")
+                continue
             new_text = read_str[len(surr_str):]
 
             if len(new_text) > 0 and not new_text.endswith("\ufffd"):

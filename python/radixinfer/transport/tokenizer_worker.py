@@ -17,6 +17,7 @@ from typing import Any, List
 
 from .protocol import (
     BatchDetokenizeRequest,
+    BatchStreamChunk,
     DetokenizeRequest,
     StreamChunk,
     TokenizeRequest,
@@ -238,18 +239,22 @@ class TokenizerProcess:
             # --- Incremental detokenize (batch) ---
             if detokenize_msgs:
                 texts = detok_manager.detokenize(detokenize_msgs)
-                for req, text in zip(detokenize_msgs, texts):
-                    self.frontend_queue.put(
-                        StreamChunk(
-                            request_id=req.request_id,
-                            token_id=req.token_id,
-                            text=text,
-                            finished=req.finished,
-                            finish_reason=req.finish_reason,
-                            prompt_tokens=req.prompt_tokens,
-                            completion_tokens=req.completion_tokens,
-                        )
+                chunks = [
+                    StreamChunk(
+                        request_id=req.request_id,
+                        token_id=req.token_id,
+                        text=text,
+                        finished=req.finished,
+                        finish_reason=req.finish_reason,
+                        prompt_tokens=req.prompt_tokens,
+                        completion_tokens=req.completion_tokens,
                     )
+                    for req, text in zip(detokenize_msgs, texts)
+                ]
+                if len(chunks) == 1:
+                    self.frontend_queue.put(chunks[0])
+                else:
+                    self.frontend_queue.put(BatchStreamChunk(chunks=chunks))
 
             if shutdown:
                 return
