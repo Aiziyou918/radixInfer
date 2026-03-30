@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-import queue
 from typing import Any, NamedTuple, NoReturn, Optional, Set, Tuple, TypeAlias
 
 import torch
@@ -15,7 +14,6 @@ from radixinfer.runtime.io import SchedulerIOMixin
 from radixinfer.runtime.prefill import ChunkedReq, PrefillManager
 from radixinfer.runtime.table import TableManager
 from radixinfer.transport.protocol import DetokenizeRequest
-from radixinfer.transport.queues import make_zmq_pull, make_zmq_push
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
@@ -301,81 +299,29 @@ def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
 
 
 # ---------------------------------------------------------------------------
-# SchedulerRuntime — lightweight wrapper for api/server.py integration
+# Process entry-points — mirrors mini-sglang's launch.py pattern
 # ---------------------------------------------------------------------------
-
-class SchedulerRuntime:
-    """Wraps Scheduler and bridges external queue I/O for api/server.py.
-
-    TP=1 (offline mode): _drain_ingress() bridges external ingress to the
-    scheduler's internal queue.Queue.
-    TP>1 (online ZMQ mode): scheduler manages its own ZMQ I/O and is called
-    via run_forever() directly.
-    """
-
-    def __init__(self, config: Any, runtime_ingress: Any, output_queue: Any, rank: int = 0) -> None:
-        from radixinfer.config import server_config_to_scheduler_config
-
-        tp_size = getattr(config, "tp_size", 1)
-        self._is_offline = (tp_size == 1)
-        self._ingress = runtime_ingress
-
-        sched_cfg = server_config_to_scheduler_config(config, rank=rank)
-        sched = Scheduler(sched_cfg)
-        if self._is_offline:
-            sched._out_queue = output_queue
-        self._impl = sched
-
-    def _drain_ingress(self) -> None:
-        """Read all pending items from runtime_ingress into the scheduler (offline/TP=1 only)."""
-        while True:
-            try:
-                req = self._ingress.get_nowait()
-            except Exception:
-                break
-            if req is None:
-                break
-            self._impl.enqueue(req)
-
-    @torch.inference_mode()
-    def run_forever(self) -> NoReturn:
-        if self._is_offline:
-            # TP=1: manual bridge from external ingress to scheduler's _in_queue
-            with self._impl.engine_stream_ctx:
-                self._impl.engine.stream.wait_stream(self._impl.stream)
-                while True:
-                    self._drain_ingress()
-                    self._impl.normal_loop()
-        else:
-            # TP>1: scheduler manages its own ZMQ I/O
-            self._impl.run_forever()
-
 
 def _run_scheduler_process(
     config: Any,
-    runtime_ingress: Any,
-    output_queue: Any,
     ack_queue: Any = None,
     rank: int = 0,
 ) -> None:
-    """Entry point for the runtime subprocess."""
-    tp_size = getattr(config, "tp_size", 1)
-    is_offline = (tp_size == 1)
+    """Entry point for each TP-rank subprocess.
 
-    if is_offline:
-        # TP=1: create ZMQ sockets if addresses given as strings
-        if isinstance(runtime_ingress, str):
-            runtime_ingress = make_zmq_pull(runtime_ingress, create=True)
-        if isinstance(output_queue, str):
-            output_queue = make_zmq_push(output_queue, create=False)
+    Mirrors mini-sglang's _run_scheduler: construct Scheduler directly,
+    barrier, ack, then run_forever().  No SchedulerRuntime bridge needed —
+    the Scheduler manages its own ZMQ I/O for both TP=1 and TP>1.
+    """
+    from radixinfer.config import server_config_to_scheduler_config
 
-    runtime = SchedulerRuntime(config, runtime_ingress, output_queue, rank=rank)
+    sched_cfg = server_config_to_scheduler_config(config, rank=rank)
+    sched = Scheduler(sched_cfg)
 
-    # Mirror mini-sglang: CPU-side barrier so all ranks finish ZMQ socket setup
-    # before rank 0 signals readiness to the parent process.
-    # Without this, rank 0 may start publishing messages before rank 1's
-    # ZMQ sub socket has connected, silently dropping the first messages.
-    runtime._impl.sync_all_ranks()
+    # CPU-side barrier: all ranks must finish ZMQ socket setup before rank 0
+    # signals readiness.  Without this, rank 0 may publish before rank 1's
+    # sub-socket has connected, silently dropping the first batch of messages.
+    sched.sync_all_ranks()
 
     if ack_queue is not None:
         try:
@@ -384,32 +330,30 @@ def _run_scheduler_process(
             pass
 
     try:
-        runtime.run_forever()
-    except KeyboardInterrupt:
+        sched.run_forever()
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        runtime._impl.shutdown()
+        sched.shutdown()
 
 
 def start_runtime_process(
     config: Any,
-    runtime_ingress: Any,
-    output_queue: Any,
     *,
     ack_queue: Any = None,
 ) -> list:
-    """Spawn daemon subprocesses running the Scheduler loop.
+    """Spawn one daemon subprocess per TP rank running the Scheduler loop.
 
     Returns a list of mp.Process objects (one per TP rank).
     Only rank 0 receives ack_queue; its ack implies all ranks have completed
-    torch.distributed.init_process_group.
+    torch.distributed.init_process_group and ZMQ setup.
     """
     tp_size = getattr(config, "tp_size", 1)
     processes = []
     for rank in range(tp_size):
         process = mp.Process(
             target=_run_scheduler_process,
-            args=(config, runtime_ingress, output_queue, ack_queue if rank == 0 else None, rank),
+            args=(config, ack_queue if rank == 0 else None, rank),
             name=f"radixinfer-runtime-{rank}",
             daemon=True,
         )

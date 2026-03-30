@@ -11,8 +11,8 @@ class ServerConfig:
     model: str = "debug"
     tokenizer_workers: int = 1
     runtime_workers: int = 1
-    max_running_requests: int = 128
-    max_prefill_tokens: int = 2048
+    max_running_requests: int = 256
+    max_prefill_tokens: int = 8192
     page_size: int = 16
     total_pages: int = 4096
     max_batch_size: int = 32
@@ -79,7 +79,4 @@ def server_config_to_scheduler_config(cfg: ServerConfig, rank: int = 0):
         max_extend_tokens=cfg.max_prefill_tokens,
         dist_port=cfg.dist_port,
         _unique_suffix=cfg._unique_suffix,
-        # TP=1: SchedulerRuntime bridges queues manually (offline mode).
-        # TP>1: SchedulerIOMixin manages ZMQ sockets directly (online mode).
-        offline_mode=(cfg.tp_size == 1),
     )

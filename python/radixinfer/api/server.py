@@ -24,9 +24,10 @@ except ModuleNotFoundError:
 
 from radixinfer.config import ServerConfig
 from radixinfer.runtime.scheduler import start_runtime_process
-from radixinfer.transport.queues import make_zmq_pull, make_zmq_push
+from radixinfer.transport.queues import make_zmq_async_pull, make_zmq_pull, make_zmq_push
 from radixinfer.transport.protocol import (
     AbortRequest,
+    BatchStreamChunk,
     SamplingParams,
     StreamChunk,
     TokenizeRequest,
@@ -137,7 +138,7 @@ class AppState:
             if self.config.use_zmq and has_zmq():
                 self.tokenizer_ingress = make_zmq_push(self.config.zmq_tokenizer_addr, create=False)
                 self.runtime_ingress = make_zmq_push(self.config.zmq_backend_addr, create=False)
-                self.frontend_queue = make_zmq_pull(self.config.zmq_frontend_addr, create=True)
+                self.frontend_queue = make_zmq_async_pull(self.config.zmq_frontend_addr, create=True)
             if self.tokenizer_process is None:
                 self.tokenizer_process = start_tokenizer_process(
                     self.config.zmq_tokenizer_addr if self.config.use_zmq and has_zmq() else self.tokenizer_ingress,
@@ -151,8 +152,6 @@ class AppState:
                 ack_queue = mp.Queue()
                 self.runtime_processes = start_runtime_process(
                     self.config,
-                    self.config.zmq_backend_addr if self.config.use_zmq and has_zmq() else self.runtime_ingress,
-                    self.config.zmq_tokenizer_addr if self.config.use_zmq and has_zmq() else self.tokenizer_ingress,
                     ack_queue=ack_queue,
                 )
                 deadline = time.monotonic() + 300
@@ -187,20 +186,29 @@ class AppState:
             self.listen_task = asyncio.create_task(self._listen_frontend())
 
     async def _listen_frontend(self) -> None:
+        import inspect
         from queue import Empty
 
+        get = self.frontend_queue.get
+        is_async = inspect.iscoroutinefunction(get)
         try:
             while True:
-                try:
-                    chunk = self.frontend_queue.get_nowait()
-                except Empty:
-                    await asyncio.sleep(0.001)
-                    continue
-                if chunk is None:
+                if is_async:
+                    msg = await get()
+                else:
+                    # Fallback: offline/test mode uses mp.Queue (sync poll)
+                    try:
+                        msg = self.frontend_queue.get_nowait()
+                    except Empty:
+                        await asyncio.sleep(0.001)
+                        continue
+                if msg is None:
                     return
-                queue = self.listeners.get(chunk.request_id)
-                if queue is not None:
-                    await queue.put(chunk)
+                chunks = msg.chunks if isinstance(msg, BatchStreamChunk) else [msg]
+                for chunk in chunks:
+                    queue = self.listeners.get(chunk.request_id)
+                    if queue is not None:
+                        await queue.put(chunk)
         except asyncio.CancelledError:
             return
 

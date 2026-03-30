@@ -1,18 +1,3 @@
-"""SchedulerIOMixin — ZMQ-based I/O abstraction for Scheduler.
-
-Mirrors mini-sglang's scheduler/io.py.  Provides two virtual methods that
-Scheduler subclasses (or Scheduler itself) call:
-
-  receive_msg(blocking) -> list[msg]   — drain incoming messages
-  send_result(results)                 — send DetokenizeRequest(s) to detokenizer
-
-For TP=1 (single rank) a plain ZMQ push/pull pair is used.
-For TP>1 rank-0 receives from the tokenizer and broadcasts to other ranks via
-a ZMQ pub/sub channel; other ranks only receive the broadcast.
-
-In offline mode (tests / inline API) the methods are overridden to use plain
-queue.Queue objects so no ZMQ sockets are created.
-"""
 from __future__ import annotations
 
 import queue
