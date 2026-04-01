@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import multiprocessing as mp
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from typing import Any
 
 try:
     from fastapi import FastAPI, Request
@@ -23,17 +20,11 @@ except ModuleNotFoundError:
         pass
 
 from radixinfer.config import ServerConfig
-from radixinfer.runtime.scheduler import start_runtime_process
-from radixinfer.transport.queues import make_zmq_async_pull, make_zmq_pull, make_zmq_push
 from radixinfer.transport.protocol import (
-    AbortRequest,
-    BatchStreamChunk,
     SamplingParams,
     StreamChunk,
-    TokenizeRequest,
 )
-from radixinfer.transport.tokenizer_worker import start_tokenizer_process
-from radixinfer.utils.mp import has_zmq
+from radixinfer.server.frontend import FrontendManager
 
 
 class ChatMessage(BaseModel):
@@ -89,202 +80,7 @@ class ChatCompletionRequest(BaseModel):
     stream_options: StreamOptions | None = None
 
 
-@dataclass
-class AppState:
-    config: ServerConfig
-    tokenizer_ingress: Any = field(default_factory=mp.Queue)
-    runtime_ingress: Any = field(default_factory=mp.Queue)
-    frontend_queue: Any = field(default_factory=mp.Queue)
-    request_counter: int = 0
-    tokenizer_process: mp.Process | None = None
-    runtime_processes: list = field(default_factory=list)
-    listeners: dict[int, asyncio.Queue[StreamChunk]] = field(default_factory=dict)
-    listen_task: asyncio.Task | None = None
-
-    def _stop_process(self, process: mp.Process | None, *, name: str) -> bool:
-        if process is None:
-            return True
-        process.join(timeout=1)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
-        if process.is_alive():
-            try:
-                process.kill()
-            except Exception:
-                pass
-            process.join(timeout=5)
-        return not process.is_alive()
-
-    def _destroy_zmq_context(self) -> None:
-        try:
-            import zmq
-
-            zmq.Context.instance().destroy(linger=0)
-        except Exception:
-            pass
-
-    def _cleanup_startup_failure(self) -> None:
-        for p in self.runtime_processes:
-            self._stop_process(p, name="runtime")
-        self._stop_process(self.tokenizer_process, name="tokenizer")
-        self.runtime_processes = []
-        self.tokenizer_process = None
-        self._destroy_zmq_context()
-
-    def start(self) -> None:
-        ack_queue: mp.Queue | None = None
-        try:
-            if self.config.use_zmq and has_zmq():
-                self.tokenizer_ingress = make_zmq_push(self.config.zmq_tokenizer_addr, create=False)
-                self.runtime_ingress = make_zmq_push(self.config.zmq_backend_addr, create=False)
-                self.frontend_queue = make_zmq_async_pull(self.config.zmq_frontend_addr, create=True)
-            if self.tokenizer_process is None:
-                self.tokenizer_process = start_tokenizer_process(
-                    self.config.zmq_tokenizer_addr if self.config.use_zmq and has_zmq() else self.tokenizer_ingress,
-                    self.config.zmq_backend_addr if self.config.use_zmq and has_zmq() else self.runtime_ingress,
-                    self.config.zmq_frontend_addr if self.config.use_zmq and has_zmq() else self.frontend_queue,
-                    self.config.tokenizer_name or self.config.model,
-                )
-            if not self.runtime_processes:
-                import time
-
-                ack_queue = mp.Queue()
-                self.runtime_processes = start_runtime_process(
-                    self.config,
-                    ack_queue=ack_queue,
-                )
-                deadline = time.monotonic() + 300
-                while time.monotonic() < deadline:
-                    dead = [p for p in self.runtime_processes if not p.is_alive()]
-                    if dead:
-                        codes = [p.exitcode for p in dead]
-                        raise RuntimeError(
-                            f"Runtime process(es) exited unexpectedly during startup "
-                            f"(exit codes: {codes}). "
-                            f"Check for port conflicts (--dist-port={self.config.dist_port}) or model load errors."
-                        )
-                    try:
-                        ack_queue.get(timeout=0.5)
-                        return
-                    except Exception:
-                        continue
-                raise RuntimeError(
-                    f"Runtime process did not signal readiness within 300 seconds "
-                    f"(dist-port={self.config.dist_port})."
-                )
-        except Exception:
-            self._cleanup_startup_failure()
-            raise
-        finally:
-            if ack_queue is not None:
-                ack_queue.close()
-                ack_queue.join_thread()
-
-    async def start_listener(self) -> None:
-        if self.listen_task is None:
-            self.listen_task = asyncio.create_task(self._listen_frontend())
-
-    async def _listen_frontend(self) -> None:
-        import inspect
-        from queue import Empty
-
-        get = self.frontend_queue.get
-        is_async = inspect.iscoroutinefunction(get)
-        try:
-            while True:
-                if is_async:
-                    msg = await get()
-                else:
-                    # Fallback: offline/test mode uses mp.Queue (sync poll)
-                    try:
-                        msg = self.frontend_queue.get_nowait()
-                    except Empty:
-                        await asyncio.sleep(0.001)
-                        continue
-                if msg is None:
-                    return
-                chunks = msg.chunks if isinstance(msg, BatchStreamChunk) else [msg]
-                for chunk in chunks:
-                    queue = self.listeners.get(chunk.request_id)
-                    if queue is not None:
-                        await queue.put(chunk)
-        except asyncio.CancelledError:
-            return
-
-    def next_request_id(self) -> int:
-        current = self.request_counter
-        self.request_counter += 1
-        return current
-
-    def submit_request(
-        self,
-        request_id: int,
-        prompt: str,
-        sampling: SamplingParams,
-        messages: list | None = None,
-    ) -> None:
-        self.tokenizer_ingress.put(
-            TokenizeRequest(
-                request_id=request_id,
-                prompt=prompt,
-                sampling=sampling,
-                messages=messages,
-            )
-        )
-
-    async def abort_request(self, request_id: int) -> None:
-        self.runtime_ingress.put(AbortRequest(request_id=request_id))
-
-    async def collect_response(
-        self,
-        request_id: int,
-        output_queue: asyncio.Queue[StreamChunk],
-    ) -> tuple[str, str, dict[str, int]]:
-        parts: list[str] = []
-        finish_reason = "stop"
-        usage = _build_usage(0, 0)
-        while True:
-            chunk = await output_queue.get()
-            if chunk.text:
-                parts.append(chunk.text)
-            if chunk.finished:
-                finish_reason = chunk.finish_reason
-                usage = _build_usage(chunk.prompt_tokens or 0, chunk.completion_tokens or 0)
-                break
-        return "".join(parts), finish_reason, usage
-
-    async def shutdown(self) -> None:
-        self.tokenizer_ingress.put(None)
-        self.runtime_ingress.put(None)
-        if self.listen_task is not None:
-            self.listen_task.cancel()
-            await asyncio.gather(self.listen_task, return_exceptions=True)
-        tokenizer_stopped = self._stop_process(self.tokenizer_process, name="tokenizer")
-        # Wait for all runtime processes together so TP ranks can reach sync_all_ranks()
-        # simultaneously and coordinate destroy_process_group() cleanly.
-        deadline = time.monotonic() + 30
-        for p in self.runtime_processes:
-            remaining = max(0.1, deadline - time.monotonic())
-            p.join(timeout=remaining)
-        for i, p in enumerate(self.runtime_processes):
-            if p.is_alive():
-                p.terminate()
-                p.join(timeout=5)
-            if p.is_alive():
-                try:
-                    p.kill()
-                except Exception:
-                    pass
-                p.join(timeout=5)
-        runtime_stopped = all(not p.is_alive() for p in self.runtime_processes)
-        self.tokenizer_process = None
-        self.runtime_processes = []
-        self._destroy_zmq_context()
-        if not tokenizer_stopped or not runtime_stopped:
-            print(
-                "Warning: forced shutdown was required for one or more worker processes."
-            )
+AppState = FrontendManager
 
 
 def _flatten_prompt(request: ChatCompletionRequest) -> str:
@@ -443,7 +239,12 @@ def _build_text_stream_payload(
     }
 
 
-def create_app(config: ServerConfig, state: AppState | None = None) -> FastAPI:
+def create_app(
+    config: ServerConfig,
+    state: FrontendManager | None = None,
+    *,
+    manage_backend: bool = True,
+) -> FastAPI:
     if FastAPI is None or Request is None or StreamingResponse is None:
         raise RuntimeError("FastAPI dependencies are not installed. Install project dependencies first.")
     if state is None:
@@ -451,7 +252,8 @@ def create_app(config: ServerConfig, state: AppState | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        state.start()
+        if manage_backend:
+            state.start()
         await state.start_listener()
         yield
         await state.shutdown()

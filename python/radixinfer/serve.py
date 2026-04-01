@@ -6,8 +6,9 @@ import socket
 
 import uvicorn
 
-from .api.server import AppState, create_app
+from .api.server import create_app
 from .config import ServerConfig
+from .server import FrontendManager
 
 
 def _is_tcp_port_available(port: int) -> bool:
@@ -68,9 +69,9 @@ async def _run_shell(config: ServerConfig) -> None:
     from radixinfer.env import ENV
     from radixinfer.transport.protocol import SamplingParams, StreamChunk
 
-    state = AppState(config=config)
+    state = FrontendManager(config=config)
     try:
-        state.start()
+        state.start_backend()
         await state.start_listener()
 
         print("radixInfer shell. /exit to quit, /reset to clear history.")
@@ -144,7 +145,9 @@ def main() -> None:
         if run_shell:
             asyncio.run(_run_shell(config))
         else:
-            app = create_app(config)
+            state = FrontendManager(config=config)
+            state.start_backend()
+            app = create_app(config, state=state, manage_backend=False)
             uvicorn.run(app, host=config.host, port=config.port, log_level="info")
     except (KeyboardInterrupt, SystemExit):
         pass
