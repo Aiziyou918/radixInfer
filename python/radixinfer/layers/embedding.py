@@ -97,7 +97,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
-        if batch.is_prefill:
+        if not batch.is_decode:  # prefill or mixed: select last token per request
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()
             del indices

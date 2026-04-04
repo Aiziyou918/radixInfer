@@ -49,11 +49,11 @@ class HybridBackend(BaseAttnBackend):
     def forward(
         self, q: "torch.Tensor", k: "torch.Tensor", v: "torch.Tensor", layer_id: int, batch: "Batch"
     ) -> "torch.Tensor":
-        backend = self.prefill_backend if batch.is_prefill else self.decode_backend
+        backend = self.decode_backend if batch.is_decode else self.prefill_backend
         return backend.forward(q, k, v, layer_id, batch)
 
     def prepare_metadata(self, batch: "Batch") -> None:
-        backend = self.prefill_backend if batch.is_prefill else self.decode_backend
+        backend = self.decode_backend if batch.is_decode else self.prefill_backend
         backend.prepare_metadata(batch)
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:

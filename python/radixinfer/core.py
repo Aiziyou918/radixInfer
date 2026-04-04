@@ -41,8 +41,12 @@ class Req:
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
         self.device_len = len(self.input_ids)
-        self.max_device_len = len(self.input_ids) + self.output_len
+        self.max_device_len = self.device_len + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
+        # Pre-allocate full-sequence buffer to avoid O(n) torch.cat per decode step.
+        self._seq_buf: torch.Tensor = torch.empty(self.max_device_len, dtype=torch.int32)
+        self._seq_buf[: self.device_len].copy_(self.input_ids)
+        self.input_ids = self._seq_buf[: self.device_len]
 
     @property
     def remain_len(self) -> int:
@@ -57,7 +61,9 @@ class Req:
         self.device_len += 1
 
     def append_host(self, next_token: torch.Tensor) -> None:
-        self.input_ids = torch.cat([self.input_ids, next_token])
+        # complete_one() already incremented device_len; write into the pre-allocated buffer.
+        self._seq_buf[self.device_len - 1] = next_token.item()
+        self.input_ids = self._seq_buf[: self.device_len]
 
     @property
     def can_decode(self) -> bool:
@@ -74,7 +80,7 @@ class Req:
 @dataclass
 class Batch:
     reqs: List[Req]
-    phase: Literal["prefill", "decode"]
+    phase: Literal["prefill", "decode", "mixed"]
     # set by scheduler before forward
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
@@ -93,6 +99,10 @@ class Batch:
     @property
     def is_decode(self) -> bool:
         return self.phase == "decode"
+
+    @property
+    def is_mixed(self) -> bool:
+        return self.phase == "mixed"
 
     @property
     def size(self) -> int:

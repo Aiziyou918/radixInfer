@@ -119,6 +119,7 @@ class Engine:
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
+            max_running_req=config.max_running_req,
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:

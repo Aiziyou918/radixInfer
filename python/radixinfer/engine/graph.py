@@ -54,13 +54,17 @@ def _determine_cuda_graph_bs(
     cuda_graph_bs: List[int] | None,
     cuda_graph_max_bs: int | None,
     free_memory: int,
+    max_running_req: int = 256,
 ) -> List[int]:
     if cuda_graph_bs is not None:
         return cuda_graph_bs
 
     free_gb = free_memory / (1 << 30)
     if cuda_graph_max_bs is None:
-        cuda_graph_max_bs = 256 if free_gb > 80 else 160
+        # Capture at least max_running_req so that full decode batches can use
+        # CUDA graphs regardless of GPU size.
+        hw_default = 256 if free_gb > 80 else 160
+        cuda_graph_max_bs = max(max_running_req, hw_default)
 
     if cuda_graph_max_bs < 1:
         return []
@@ -81,10 +85,13 @@ class GraphRunner:
         max_seq_len: int,
         vocab_size: int,
         dummy_req: Req,
+        max_running_req: int = 256,
     ) -> None:
         from radixinfer.distributed import try_get_tp_info
 
-        cuda_graph_bs = _determine_cuda_graph_bs(cuda_graph_bs, cuda_graph_max_bs, free_memory)
+        cuda_graph_bs = _determine_cuda_graph_bs(
+            cuda_graph_bs, cuda_graph_max_bs, free_memory, max_running_req
+        )
         self.attn_backend = attn_backend
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
         self.graph_bs_list = sorted(cuda_graph_bs)
