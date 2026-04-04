@@ -56,9 +56,6 @@ class BasePrefixCache(ABC):
     @abstractmethod
     def evict(self, size: int) -> torch.Tensor: ...
 
-    @abstractmethod
-    def reset(self) -> None: ...
-
     @property
     @abstractmethod
     def size_info(self) -> SizeInfo: ...
@@ -236,15 +233,62 @@ class RadixPrefixCache(BasePrefixCache):
                 heapq.heappush(leaf_nodes, parent)
         return torch.cat(evicted).to(self.device)
 
-    def reset(self) -> None:
-        raise NotImplementedError("RadixPrefixCache.reset is not implemented")
-
     @property
     def size_info(self) -> SizeInfo:
         return SizeInfo(evictable_size=self.evictable_size, protected_size=self.protected_size)
 
     def check_integrity(self) -> None:
-        pass
+        if self.root_node.ref_count != 1:
+            raise RuntimeError(
+                f"RadixPrefixCache integrity check failed: root ref_count={self.root_node.ref_count}, expected 1"
+            )
+
+        seen: set[int] = set()
+        evictable_size = 0
+        protected_size = 0
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            if node.uuid in seen:
+                raise RuntimeError("RadixPrefixCache integrity check failed: cycle detected")
+            seen.add(node.uuid)
+
+            if node.is_root():
+                if node._parent is not None:
+                    raise RuntimeError("RadixPrefixCache integrity check failed: root has parent")
+            else:
+                if node.length <= 0:
+                    raise RuntimeError("RadixPrefixCache integrity check failed: non-root node has empty key")
+                if len(node._key) != node.length or len(node._value) != node.length:
+                    raise RuntimeError(
+                        "RadixPrefixCache integrity check failed: key/value length mismatch"
+                    )
+                parent = node.parent
+                if parent.children.get(self.key_fn(node._key)) is not node:
+                    raise RuntimeError(
+                        "RadixPrefixCache integrity check failed: parent-child linkage mismatch"
+                    )
+                if node.ref_count < 0:
+                    raise RuntimeError(
+                        f"RadixPrefixCache integrity check failed: negative ref_count={node.ref_count}"
+                    )
+                if node.ref_count == 0:
+                    evictable_size += node.length
+                else:
+                    protected_size += node.length
+
+            stack.extend(node.children.values())
+
+        if evictable_size != self.evictable_size:
+            raise RuntimeError(
+                "RadixPrefixCache integrity check failed: "
+                f"evictable_size={self.evictable_size}, expected {evictable_size}"
+            )
+        if protected_size != self.protected_size:
+            raise RuntimeError(
+                "RadixPrefixCache integrity check failed: "
+                f"protected_size={self.protected_size}, expected {protected_size}"
+            )
 
     def _tree_walk(self, input_ids: torch.Tensor) -> tuple[RadixTreeNode, int]:
         prefix_len = 0
