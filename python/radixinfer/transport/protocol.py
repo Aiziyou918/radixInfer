@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 
@@ -73,10 +73,3 @@ class BatchDetokenizeRequest:
 class BatchStreamChunk:
     """Wraps multiple StreamChunks for efficient batch transport over ZMQ."""
     chunks: list[StreamChunk]
-
-
-@dataclass(frozen=True)
-class EngineStep:
-    request_ids: list[int] = field(default_factory=list)
-    token_ids: list[int] = field(default_factory=list)
-    finished: list[bool] = field(default_factory=list)

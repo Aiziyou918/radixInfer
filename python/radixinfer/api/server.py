@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
+from typing import Callable
 
 try:
     from fastapi import FastAPI, Request
@@ -20,6 +21,7 @@ except ModuleNotFoundError:
         pass
 
 from radixinfer.config import ServerConfig
+from radixinfer.server.common import build_usage
 from radixinfer.transport.protocol import (
     SamplingParams,
     StreamChunk,
@@ -135,14 +137,6 @@ class _StreamingStopState:
         return remaining
 
 
-def _build_usage(prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-    }
-
-
 def _build_stream_payload(
     request_id: int,
     model: str,
@@ -239,6 +233,88 @@ def _build_text_stream_payload(
     }
 
 
+def _make_sampling_params(payload, stop_sequences: tuple[str, ...]) -> SamplingParams:
+    return SamplingParams(
+        max_tokens=payload.max_tokens,
+        temperature=payload.temperature,
+        top_k=payload.top_k,
+        top_p=payload.top_p,
+        ignore_eos=payload.ignore_eos,
+        stop=stop_sequences,
+        n=getattr(payload, "n", 1),
+        presence_penalty=getattr(payload, "presence_penalty", 0.0),
+        frequency_penalty=getattr(payload, "frequency_penalty", 0.0),
+    )
+
+
+def _should_include_usage(stream_options: StreamOptions | None, *, finished: bool) -> bool:
+    return finished and stream_options is not None and stream_options.include_usage
+
+
+def _sse_text_frame(text: str) -> str:
+    return f"data: {text}\n"
+
+
+def _sse_json_frame(body: dict) -> str:
+    return f"data: {json.dumps(body)}\n\n"
+
+
+async def _stream_with_stop_handling(
+    *,
+    state: FrontendManager,
+    request: Request,
+    request_id: int,
+    output_queue: asyncio.Queue[StreamChunk],
+    stop_sequences: tuple[str, ...],
+    render_chunk: Callable[[StreamChunk, str, str | None], str | None],
+    render_tail: Callable[[str], str | None],
+    done_frame: str,
+):
+    matcher = _StreamingStopState(stop_sequences)
+    try:
+        while True:
+            if await request.is_disconnected():
+                await state.abort_request(request_id)
+                break
+            chunk = await output_queue.get()
+            text = chunk.text
+            matched_stop = False
+            if text:
+                text, matched_stop = matcher.push(text)
+            finish_reason = None if not chunk.finished else chunk.finish_reason
+            if matched_stop:
+                finish_reason = "stop"
+            frame = render_chunk(chunk, text, finish_reason)
+            if frame is not None:
+                yield frame
+            if matched_stop:
+                await state.abort_request(request_id)
+                break
+            if chunk.finished:
+                tail = matcher.flush()
+                if tail:
+                    tail_frame = render_tail(tail)
+                    if tail_frame is not None:
+                        yield tail_frame
+                break
+        yield done_frame
+    finally:
+        state.close_listener(request_id)
+
+
+async def _collect_truncated_response(
+    state: FrontendManager,
+    request_id: int,
+    output_queue: asyncio.Queue[StreamChunk],
+    stop_sequences: tuple[str, ...],
+) -> tuple[str, str, dict[str, int]]:
+    content, finish_reason, usage = await state.collect_response(request_id, output_queue)
+    content, matched_stop = _truncate_for_stop_sequences(content, stop_sequences)
+    if matched_stop:
+        finish_reason = "stop"
+    return content, finish_reason, usage
+
+
 def create_app(
     config: ServerConfig,
     state: FrontendManager | None = None,
@@ -282,62 +358,38 @@ def create_app(
     @app.post("/generate")
     async def generate(payload: GenerateRequest, request: Request):
         stop_sequences = _normalize_stop_sequences(payload.stop)
-        request_id = state.next_request_id()
-        output_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
-        state.listeners[request_id] = output_queue
-        state.submit_request(
-            request_id,
+        request_id, output_queue = state.open_request(
             payload.prompt,
-            SamplingParams(
-                max_tokens=payload.max_tokens,
-                temperature=payload.temperature,
-                top_k=payload.top_k,
-                top_p=payload.top_p,
-                ignore_eos=payload.ignore_eos,
-                stop=stop_sequences,
-            ),
+            _make_sampling_params(payload, stop_sequences),
         )
 
         async def stream():
-            matcher = _StreamingStopState(stop_sequences)
-            try:
-                while True:
-                    if await request.is_disconnected():
-                        await state.abort_request(request_id)
-                        break
-                    chunk = await output_queue.get()
-                    text = chunk.text
-                    matched = False
-                    if text:
-                        text, matched = matcher.push(text)
-                    if text:
-                        yield f"data: {text}\n"
-                    if matched:
-                        await state.abort_request(request_id)
-                        yield "data: [DONE]\n"
-                        break
-                    if chunk.finished:
-                        tail = matcher.flush()
-                        if tail:
-                            yield f"data: {tail}\n"
-                        yield "data: [DONE]\n"
-                        break
-            finally:
-                state.listeners.pop(request_id, None)
+            async for frame in _stream_with_stop_handling(
+                state=state,
+                request=request,
+                request_id=request_id,
+                output_queue=output_queue,
+                stop_sequences=stop_sequences,
+                render_chunk=lambda _chunk, text, _finish_reason: (
+                    _sse_text_frame(text) if text else None
+                ),
+                render_tail=lambda tail: _sse_text_frame(tail),
+                done_frame="data: [DONE]\n",
+            ):
+                yield frame
 
         if not payload.stream:
             try:
-                content, finish_reason, usage = await state.collect_response(request_id, output_queue)
-                content, matched_stop = _truncate_for_stop_sequences(content, stop_sequences)
-                if matched_stop:
-                    finish_reason = "stop"
+                content, finish_reason, usage = await _collect_truncated_response(
+                    state, request_id, output_queue, stop_sequences
+                )
                 return {
                     "text": content,
                     "finish_reason": finish_reason,
                     "usage": usage,
                 }
             finally:
-                state.listeners.pop(request_id, None)
+                state.close_listener(request_id)
 
         return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -347,32 +399,17 @@ def create_app(
             raise HTTPException(status_code=400, detail="Only n=1 is currently supported")
 
         stop_sequences = _normalize_stop_sequences(payload.stop)
-        request_id = state.next_request_id()
         created = int(time.time())
-        output_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
-        state.listeners[request_id] = output_queue
-        state.submit_request(
-            request_id,
+        request_id, output_queue = state.open_request(
             payload.prompt,
-            SamplingParams(
-                max_tokens=payload.max_tokens,
-                temperature=payload.temperature,
-                top_k=payload.top_k,
-                top_p=payload.top_p,
-                ignore_eos=payload.ignore_eos,
-                stop=stop_sequences,
-                n=payload.n,
-                presence_penalty=payload.presence_penalty,
-                frequency_penalty=payload.frequency_penalty,
-            ),
+            _make_sampling_params(payload, stop_sequences),
         )
 
         if not payload.stream:
             try:
-                content, finish_reason, usage = await state.collect_response(request_id, output_queue)
-                content, matched_stop = _truncate_for_stop_sequences(content, stop_sequences)
-                if matched_stop:
-                    finish_reason = "stop"
+                content, finish_reason, usage = await _collect_truncated_response(
+                    state, request_id, output_queue, stop_sequences
+                )
                 return _build_text_completion_payload(
                     request_id,
                     config.model,
@@ -382,49 +419,36 @@ def create_app(
                     usage,
                 )
             finally:
-                state.listeners.pop(request_id, None)
+                state.close_listener(request_id)
 
         async def stream():
-            matcher = _StreamingStopState(stop_sequences)
-            try:
-                while True:
-                    if await request.is_disconnected():
-                        await state.abort_request(request_id)
-                        break
-                    chunk = await output_queue.get()
-                    text = chunk.text
-                    matched_stop = False
-                    if text:
-                        text, matched_stop = matcher.push(text)
-                    finish_reason = None if not chunk.finished else chunk.finish_reason
-                    if matched_stop:
-                        finish_reason = "stop"
-                    body = _build_text_stream_payload(
+            async for frame in _stream_with_stop_handling(
+                state=state,
+                request=request,
+                request_id=request_id,
+                output_queue=output_queue,
+                stop_sequences=stop_sequences,
+                render_chunk=lambda chunk, text, finish_reason: _sse_json_frame(
+                    _build_text_stream_payload(
                         request_id,
                         config.model,
                         created,
                         text,
                         finish_reason,
-                        usage=(
-                            _build_usage(chunk.prompt_tokens or 0, chunk.completion_tokens or 0)
-                            if (chunk.finished or matched_stop)
-                            and payload.stream_options
-                            and payload.stream_options.include_usage
-                            else None
-                        ),
+                        usage=build_usage(chunk.prompt_tokens or 0, chunk.completion_tokens or 0)
+                        if _should_include_usage(
+                            payload.stream_options,
+                            finished=chunk.finished or finish_reason == "stop",
+                        )
+                        else None,
                     )
-                    yield f"data: {json.dumps(body)}\n\n"
-                    if matched_stop:
-                        await state.abort_request(request_id)
-                        break
-                    if chunk.finished:
-                        tail = matcher.flush()
-                        if tail:
-                            yield f"data: {json.dumps(_build_text_stream_payload(request_id, config.model, created, tail, None))}\n\n"
-                        break
-                yield "data: [DONE]\n\n"
-            finally:
-                state.listeners.pop(request_id, None)
+                ),
+                render_tail=lambda tail: _sse_json_frame(
+                    _build_text_stream_payload(request_id, config.model, created, tail, None)
+                ),
+                done_frame="data: [DONE]\n\n",
+            ):
+                yield frame
 
         return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -434,10 +458,7 @@ def create_app(
             raise HTTPException(status_code=400, detail="Only n=1 is currently supported")
 
         stop_sequences = _normalize_stop_sequences(payload.stop)
-        request_id = state.next_request_id()
         created = int(time.time())
-        output_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
-        state.listeners[request_id] = output_queue
         # Pass messages list so the tokenizer worker can apply the chat template.
         # Fall back to flattened prompt if messages is not provided.
         chat_messages = (
@@ -445,29 +466,17 @@ def create_app(
             if payload.messages
             else None
         )
-        state.submit_request(
-            request_id,
+        request_id, output_queue = state.open_request(
             _flatten_prompt(payload),
-            SamplingParams(
-                max_tokens=payload.max_tokens,
-                temperature=payload.temperature,
-                top_k=payload.top_k,
-                top_p=payload.top_p,
-                ignore_eos=payload.ignore_eos,
-                stop=stop_sequences,
-                n=payload.n,
-                presence_penalty=payload.presence_penalty,
-                frequency_penalty=payload.frequency_penalty,
-            ),
+            _make_sampling_params(payload, stop_sequences),
             messages=chat_messages,
         )
 
         if not payload.stream:
             try:
-                content, finish_reason, usage = await state.collect_response(request_id, output_queue)
-                content, matched_stop = _truncate_for_stop_sequences(content, stop_sequences)
-                if matched_stop:
-                    finish_reason = "stop"
+                content, finish_reason, usage = await _collect_truncated_response(
+                    state, request_id, output_queue, stop_sequences
+                )
                 return _build_completion_payload(
                     request_id,
                     config.model,
@@ -477,56 +486,48 @@ def create_app(
                     usage,
                 )
             finally:
-                state.listeners.pop(request_id, None)
+                state.close_listener(request_id)
 
         async def stream():
             first = True
-            matcher = _StreamingStopState(stop_sequences)
-            try:
-                while True:
-                    if await request.is_disconnected():
-                        await state.abort_request(request_id)
-                        break
-                    chunk = await output_queue.get()
-                    text = chunk.text
-                    matched_stop = False
-                    if text:
-                        text, matched_stop = matcher.push(text)
-                    delta = {}
-                    if first:
-                        delta["role"] = "assistant"
-                        first = False
-                    if text:
-                        delta["content"] = text
-                    finish_reason = None if not chunk.finished else chunk.finish_reason
-                    if matched_stop:
-                        finish_reason = "stop"
-                    body = _build_stream_payload(
+
+            def render_chunk(chunk: StreamChunk, text: str, finish_reason: str | None) -> str:
+                nonlocal first
+                delta = {}
+                if first:
+                    delta["role"] = "assistant"
+                    first = False
+                if text:
+                    delta["content"] = text
+                return _sse_json_frame(
+                    _build_stream_payload(
                         request_id,
                         config.model,
                         created,
                         delta,
                         finish_reason,
-                        usage=(
-                            _build_usage(chunk.prompt_tokens or 0, chunk.completion_tokens or 0)
-                            if (chunk.finished or matched_stop)
-                            and payload.stream_options
-                            and payload.stream_options.include_usage
-                            else None
-                        ),
+                        usage=build_usage(chunk.prompt_tokens or 0, chunk.completion_tokens or 0)
+                        if _should_include_usage(
+                            payload.stream_options,
+                            finished=chunk.finished or finish_reason == "stop",
+                        )
+                        else None,
                     )
-                    yield f"data: {json.dumps(body)}\n\n"
-                    if matched_stop:
-                        await state.abort_request(request_id)
-                        break
-                    if chunk.finished:
-                        tail = matcher.flush()
-                        if tail:
-                            yield f"data: {json.dumps(_build_stream_payload(request_id, config.model, created, {'content': tail}, None))}\n\n"
-                        break
-                yield "data: [DONE]\n\n"
-            finally:
-                state.listeners.pop(request_id, None)
+                )
+
+            async for frame in _stream_with_stop_handling(
+                state=state,
+                request=request,
+                request_id=request_id,
+                output_queue=output_queue,
+                stop_sequences=stop_sequences,
+                render_chunk=render_chunk,
+                render_tail=lambda tail: _sse_json_frame(
+                    _build_stream_payload(request_id, config.model, created, {"content": tail}, None)
+                ),
+                done_frame="data: [DONE]\n\n",
+            ):
+                yield frame
 
         return StreamingResponse(stream(), media_type="text/event-stream")
 
