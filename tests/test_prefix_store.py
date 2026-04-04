@@ -1,90 +1,78 @@
-from radixinfer.cache.page_pool import PageSpan
-from radixinfer.cache.prefix_store import PrefixStore
+import torch
+
+import radixinfer.core as core_mod
+from radixinfer.cache.prefix_store import RadixPrefixCache
+from radixinfer.core import Context
 
 
-def test_prefix_store_matches_page_aligned_prefix() -> None:
-    store = PrefixStore(capacity=4, page_size=2)
-    key, evicted = store.insert([1, 2, 3, 4, 5], PageSpan(page_ids=(0, 1), token_count=4))
-    assert key is not None
-    assert evicted == []
-    hit = store.match([1, 2, 3, 4, 9])
-    assert hit.matched_tokens == 4
-    assert hit.cached_span is not None
-    assert hit.cached_span.page_ids == (0, 1)
-    assert hit.cache_key == key
+def _make_cache(page_size: int = 2) -> RadixPrefixCache:
+    core_mod._GLOBAL_CTX = None
+    ctx = Context(page_size=page_size)
+    ctx.page_table = torch.empty(1, 1, dtype=torch.int32)
+    core_mod.set_global_ctx(ctx)
+    return RadixPrefixCache(device=torch.device("cpu"))
 
 
-def test_prefix_store_tracks_lock_refcount() -> None:
-    store = PrefixStore(capacity=4, page_size=2)
-    key, _ = store.insert([1, 2, 3, 4], PageSpan(page_ids=(0, 1), token_count=4))
-    assert key is not None
-    assert store.size_info.evictable_size == 4
-    assert store.size_info.protected_size == 0
-    store.lock(key)
-    assert store.entry_ref_count(key) == 1
-    assert store.size_info.evictable_size == 0
-    assert store.size_info.protected_size == 4
-    store.unlock(key)
-    assert store.entry_ref_count(key) == 0
-    assert store.size_info.evictable_size == 4
-    assert store.size_info.protected_size == 0
-    store.check_integrity()
+def test_radix_prefix_cache_matches_page_aligned_prefix() -> None:
+    cache = _make_cache(page_size=2)
+    inserted = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32)
+    indices = torch.tensor([10, 11, 12, 13, 14], dtype=torch.int32)
+
+    cached_len, handle = cache.insert_prefix(inserted, indices)
+    assert cached_len == 0
+    assert handle.cached_len == 4
+
+    hit = cache.match_prefix(torch.tensor([1, 2, 3, 4, 9], dtype=torch.int32))
+    assert hit.cuda_handle.cached_len == 4
+    assert torch.equal(
+        hit.cuda_handle.get_matched_indices(),
+        torch.tensor([10, 11, 12, 13], dtype=torch.int32),
+    )
 
 
-def test_prefix_store_evicts_only_unlocked_entries_when_over_capacity() -> None:
-    store = PrefixStore(capacity=1, page_size=2)
-    key1, evicted1 = store.insert([1, 2], PageSpan(page_ids=(0,), token_count=2))
-    assert key1 is not None
-    assert evicted1 == []
-    store.lock(key1)
-    key2, evicted2 = store.insert([3, 4], PageSpan(page_ids=(1,), token_count=2))
-    assert key2 is not None
-    assert evicted2 == [PageSpan(page_ids=(1,), token_count=2)]
-    store.unlock(key1)
-    key3, evicted3 = store.insert([5, 6], PageSpan(page_ids=(2,), token_count=2))
-    assert key3 is not None
-    assert evicted3 == [PageSpan(page_ids=(0,), token_count=2)]
-    assert store.size_info.evictable_size == 2
-    assert store.size_info.protected_size == 0
-    store.check_integrity()
+def test_radix_prefix_cache_lock_unlock_updates_size_info() -> None:
+    cache = _make_cache(page_size=2)
+    _, handle = cache.insert_prefix(
+        torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+        torch.tensor([20, 21, 22, 23], dtype=torch.int32),
+    )
+
+    assert cache.size_info.evictable_size == 4
+    assert cache.size_info.protected_size == 0
+
+    cache.lock_handle(handle)
+    assert cache.size_info.evictable_size == 0
+    assert cache.size_info.protected_size == 4
+
+    cache.lock_handle(handle, unlock=True)
+    assert cache.size_info.evictable_size == 4
+    assert cache.size_info.protected_size == 0
+    cache.check_integrity()
 
 
-def test_prefix_store_splits_existing_branch_on_partial_match() -> None:
-    store = PrefixStore(capacity=4, page_size=2)
-    key1, _ = store.insert([1, 2, 3, 4, 5, 6], PageSpan(page_ids=(0, 1, 2), token_count=6))
-    assert key1 is not None
-    assert store.size_info.evictable_size == 6
-    hit = store.match([1, 2, 3, 4, 9, 10])
-    assert hit.matched_tokens == 4
-    assert hit.cached_span == PageSpan(page_ids=(0, 1), token_count=4)
-    assert hit.cache_key is not None
-    assert store.size_info.evictable_size == 6
-    store.check_integrity()
+def test_radix_prefix_cache_evict_returns_requested_budget() -> None:
+    cache = _make_cache(page_size=2)
+    cache.insert_prefix(
+        torch.tensor([1, 2], dtype=torch.int32),
+        torch.tensor([30, 31], dtype=torch.int32),
+    )
+    cache.insert_prefix(
+        torch.tensor([3, 4, 5, 6], dtype=torch.int32),
+        torch.tensor([40, 41, 42, 43], dtype=torch.int32),
+    )
+
+    evicted = cache.evict(2)
+    assert torch.equal(evicted, torch.tensor([30, 31], dtype=torch.int32))
+    assert cache.size_info.evictable_size == 4
+    assert cache.size_info.protected_size == 0
+    cache.check_integrity()
 
 
-def test_prefix_store_locking_split_node_protects_ancestors_only_once() -> None:
-    store = PrefixStore(capacity=4, page_size=2)
-    key, _ = store.insert([1, 2, 3, 4, 5, 6], PageSpan(page_ids=(0, 1, 2), token_count=6))
-    assert key is not None
-    hit = store.match([1, 2, 3, 4, 9, 10])
-    assert hit.cache_key is not None
-    store.lock(hit.cache_key)
-    assert store.size_info.protected_size == 4
-    assert store.size_info.evictable_size == 2
-    store.unlock(hit.cache_key)
-    assert store.size_info.protected_size == 0
-    assert store.size_info.evictable_size == 6
-    store.check_integrity()
-
-
-def test_prefix_store_can_evict_by_requested_token_budget() -> None:
-    store = PrefixStore(capacity=4, page_size=2)
-    key1, _ = store.insert([1, 2], PageSpan(page_ids=(0,), token_count=2))
-    key2, _ = store.insert([3, 4, 5, 6], PageSpan(page_ids=(1, 2), token_count=4))
-    assert key1 is not None
-    assert key2 is not None
-    evicted = store.evict(2)
-    assert evicted == [PageSpan(page_ids=(0,), token_count=2)]
-    assert store.size_info.evictable_size == 4
-    assert store.size_info.protected_size == 0
-    store.check_integrity()
+def test_radix_prefix_cache_rejects_invalid_handle_type() -> None:
+    cache = _make_cache(page_size=2)
+    try:
+        cache.lock_handle(object())  # type: ignore[arg-type]
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("lock_handle should reject non-cache handles")

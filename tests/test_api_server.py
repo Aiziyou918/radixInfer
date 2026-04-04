@@ -61,7 +61,6 @@ def make_app():
         model="debug",
         device="cpu",
         max_prefill_tokens=8,
-        max_batch_size=4,
     )
     return create_app(config, state=FakeAppState(config=config))
 
