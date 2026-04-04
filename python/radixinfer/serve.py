@@ -39,14 +39,11 @@ def parse_args() -> tuple[ServerConfig, bool]:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=1919)
     parser.add_argument("--model", default="debug")
-    parser.add_argument("--tokenizer-workers", type=int, default=1)
-    parser.add_argument("--runtime-workers", type=int, default=1)
     parser.add_argument("--max-running-requests", type=int, default=256)
     parser.add_argument("--max-prefill-length", dest="max_prefill_tokens", type=int, default=8192)
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--num-pages", dest="total_pages", type=int, default=None,
                         help="Total KV cache pages (default: auto based on available GPU memory)")
-    parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--tp-size", dest="tp_size", type=int, default=1)
     parser.add_argument(
@@ -103,9 +100,7 @@ async def _run_shell(config: ServerConfig) -> None:
                 {"role": "user", "content": user_input},
             ]
 
-            request_id = state.next_request_id()
-            output_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
-            state.listeners[request_id] = output_queue
+            request_id, output_queue = state.open_listener()
             state.submit_request(
                 request_id,
                 user_input,
@@ -130,7 +125,7 @@ async def _run_shell(config: ServerConfig) -> None:
                 print()
                 history.append((user_input, cur_text))
             finally:
-                state.listeners.pop(request_id, None)
+                state.close_listener(request_id)
 
     except KeyboardInterrupt:
         print()
