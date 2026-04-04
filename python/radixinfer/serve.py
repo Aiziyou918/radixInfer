@@ -44,7 +44,8 @@ def parse_args() -> tuple[ServerConfig, bool]:
     parser.add_argument("--max-running-requests", type=int, default=256)
     parser.add_argument("--max-prefill-length", dest="max_prefill_tokens", type=int, default=8192)
     parser.add_argument("--page-size", type=int, default=16)
-    parser.add_argument("--num-pages", dest="total_pages", type=int, default=4096)
+    parser.add_argument("--num-pages", dest="total_pages", type=int, default=None,
+                        help="Total KV cache pages (default: auto based on available GPU memory)")
     parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--tp-size", dest="tp_size", type=int, default=1)

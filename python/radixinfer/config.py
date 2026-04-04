@@ -14,7 +14,7 @@ class ServerConfig:
     max_running_requests: int = 256
     max_prefill_tokens: int = 8192
     page_size: int = 16
-    total_pages: int = 4096
+    total_pages: int | None = None  # None = auto-detect from available GPU memory
     max_batch_size: int = 32
     prefix_cache_capacity: int = 4096
     queue_poll_interval: float = 0.005
