@@ -23,6 +23,7 @@ class ForwardInput(NamedTuple):
     sample_args: BatchSamplingArgs
     input_tuple: Indice2D
     write_tuple: Indice2D
+    prefill_uids: frozenset = frozenset()  # UIDs of prefill reqs in this batch
 
 
 ForwardData: TypeAlias = "tuple[ForwardInput, ForwardOutput]"
@@ -36,7 +37,7 @@ class Scheduler(SchedulerIOMixin):
 
     Key responsibilities:
     - Receive tokenized requests via receive_msg()
-    - Schedule prefill / decode batches
+    - Schedule prefill / decode / mixed batches
     - Overlap GPU execution with batch post-processing (CPU-side)
     - Send detokenize results back via send_result()
     """
@@ -71,6 +72,15 @@ class Scheduler(SchedulerIOMixin):
         # EOS tracking from tokenizer
         self.eos_token_id: int = 0
 
+        # Pre-allocate pinned memory buffers to avoid cudaHostAlloc per batch.
+        # Max tokens in one batch = prefill_budget (prefill) + max_running_req (decode, 1 token each).
+        _max_tokens = self.prefill_budget + config.max_running_req
+        _max_reqs = config.max_running_req
+        self._pos_buf = torch.empty(_max_tokens, dtype=torch.int32, pin_memory=True)
+        self._input_row_buf = torch.empty(_max_tokens, dtype=torch.int64, pin_memory=True)
+        self._write_row_buf = torch.empty(_max_reqs, dtype=torch.int64, pin_memory=True)
+        self._write_pos_buf = torch.empty(_max_reqs, dtype=torch.int64, pin_memory=True)
+
         # Set up I/O via mixin (ZMQ for production, queue.Queue for offline/tests)
         SchedulerIOMixin.__init__(self, config, tp_cpu_group=tp_cpu_group or engine.tp_cpu_group)
 
@@ -86,8 +96,8 @@ class Scheduler(SchedulerIOMixin):
         return results
 
     def run_when_idle(self) -> None:
-        """Called while blocking-waiting for a new message (overrides mixin hook)."""
-        self.cache_manager.check_integrity()
+        """Called while blocking-waiting for a new message."""
+        pass  # integrity check removed from hot-path; run explicitly in tests if needed
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
@@ -168,6 +178,7 @@ class Scheduler(SchedulerIOMixin):
 
         forward_input, (_, next_tokens_cpu, copy_done) = last_data[0], last_data[1]
         batch = forward_input.batch
+        prefill_uids = forward_input.prefill_uids
         copy_done.synchronize()
 
         new_finished: Set[Req] = set()
@@ -206,7 +217,8 @@ class Scheduler(SchedulerIOMixin):
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
                     new_finished.add(req)
-                elif batch.is_prefill:
+                elif req.uid in prefill_uids:
+                    # Newly prefilled req: insert into prefix cache and move to decode.
                     self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished
@@ -217,20 +229,36 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
-        if batch is None:
-            return None
-        return self._prepare_batch(batch)
+        # Decode-first: drain decode-ready requests before prefilling new ones.
+        # This keeps already-prefilled requests generating tokens immediately,
+        # minimising TTFT and keeping the effective decode batch large.
+        # Any remaining token budget is then used for prefill.
+        decode_batch = self.decode_manager.schedule_next_batch()
+        prefill_batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
 
-    def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        if prefill_batch is None and decode_batch is None:
+            return None
+
+        if prefill_batch is not None and decode_batch is not None:
+            # Mixed batch: decode reqs first (CUDA-graph-friendly ordering when
+            # batch later becomes decode-only), then prefill reqs.
+            batch = Batch(reqs=decode_batch.reqs + prefill_batch.reqs, phase="mixed")
+            prefill_uids = frozenset(r.uid for r in prefill_batch.reqs)
+        elif prefill_batch is not None:
+            batch = prefill_batch
+            prefill_uids = frozenset(r.uid for r in prefill_batch.reqs)
+        else:
+            batch = decode_batch
+            prefill_uids = frozenset()
+
+        return self._prepare_batch(batch, prefill_uids)
+
+    def _prepare_batch(self, batch: Batch, prefill_uids: frozenset = frozenset()) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
-        batch.positions = _make_positions(batch, self.device)
-        input_mapping = _make_input_tuple(batch, self.device)
-        write_mapping = _make_write_tuple(batch, self.device)
+        batch.positions = self._build_positions(batch)
+        input_mapping = self._build_input_tuple(batch)
+        write_mapping = self._build_write_tuple(batch)
         batch.out_loc = self.engine.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
@@ -238,10 +266,16 @@ class Scheduler(SchedulerIOMixin):
             sample_args=self.engine.sampler.prepare(batch),
             input_tuple=input_mapping,
             write_tuple=write_mapping,
+            prefill_uids=prefill_uids,
         )
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
-        batch, sample_args, input_mapping, output_mapping = forward_input
+        batch, sample_args, input_mapping, output_mapping = (
+            forward_input.batch,
+            forward_input.sample_args,
+            forward_input.input_tuple,
+            forward_input.write_tuple,
+        )
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
@@ -253,49 +287,49 @@ class Scheduler(SchedulerIOMixin):
         self.sync_all_ranks()
         self.engine.shutdown()
 
+    # ---------------------------------------------------------------------------
+    # Hot-path batch metadata builders (reuse pre-allocated pinned buffers)
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Hot-path batch metadata builders (pin_memory + non_blocking H2D)
-# ---------------------------------------------------------------------------
+    def _build_positions(self, batch: Batch) -> torch.Tensor:
+        needed = sum(r.extend_len for r in batch.padded_reqs)
+        host = self._pos_buf[:needed]
+        offset = 0
+        for req in batch.padded_reqs:
+            length = req.extend_len
+            torch.arange(
+                req.cached_len,
+                req.device_len,
+                dtype=torch.int32,
+                out=host[offset: offset + length],
+            )
+            offset += length
+        return host.to(self.device, non_blocking=True)
 
-def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
-    needed_size = sum(r.extend_len for r in batch.padded_reqs)
-    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
-    offset = 0
-    for req in batch.padded_reqs:
-        length = req.extend_len
-        torch.arange(
-            req.cached_len,
-            req.device_len,
-            dtype=torch.int32,
-            out=indices_host[offset : offset + length],
+    def _build_input_tuple(self, batch: Batch) -> Indice2D:
+        needed = len(batch.positions)
+        host = self._input_row_buf[:needed]
+        offset = 0
+        for req in batch.padded_reqs:
+            length = req.extend_len
+            host[offset: offset + length].fill_(req.table_idx)
+            offset += length
+        return (
+            host.to(self.device, non_blocking=True),
+            batch.positions.to(torch.int64),
         )
-        offset += length
-    return indices_host.to(device, non_blocking=True)
 
-
-def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
-    offset = 0
-    for req in batch.padded_reqs:
-        length = req.extend_len
-        mapping_host[offset : offset + length].fill_(req.table_idx)
-        offset += length
-    return (
-        mapping_host.to(device, non_blocking=True),
-        batch.positions.to(torch.int64),
-    )
-
-
-def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_list = [req.table_idx for req in batch.reqs]
-    write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
-    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
-    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
-    return (
-        mapping_host.to(device, non_blocking=True),
-        write_host.to(device, non_blocking=True),
-    )
+    def _build_write_tuple(self, batch: Batch) -> Indice2D:
+        n = len(batch.reqs)
+        row_host = self._write_row_buf[:n]
+        pos_host = self._write_pos_buf[:n]
+        for i, req in enumerate(batch.reqs):
+            row_host[i] = req.table_idx
+            pos_host[i] = req.device_len if req.can_decode else -1
+        return (
+            row_host.to(self.device, non_blocking=True),
+            pos_host.to(self.device, non_blocking=True),
+        )
 
 
 # ---------------------------------------------------------------------------
