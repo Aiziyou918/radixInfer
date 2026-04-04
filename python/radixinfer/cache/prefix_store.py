@@ -84,7 +84,10 @@ class RadixTreeNode:
         self._length: int
 
     def set_key_value(self, key: torch.Tensor, value: torch.Tensor) -> None:
-        assert len(key) == len(value)
+        if len(key) != len(value):
+            raise ValueError(
+                f"RadixTreeNode key/value length mismatch: {len(key)} != {len(value)}"
+            )
         self._key = key
         self._value = value
         self._length = len(key)
@@ -99,7 +102,8 @@ class RadixTreeNode:
 
     @property
     def parent(self) -> RadixTreeNode:
-        assert self._parent is not None
+        if self._parent is None:
+            raise RuntimeError("RadixTreeNode parent is not set")
         return self._parent
 
     @property
@@ -118,7 +122,10 @@ class RadixTreeNode:
         return fast_compare_key(self._key, input_ids, cmp_len)
 
     def split_at(self, pos: int) -> RadixTreeNode:
-        assert 0 < pos < self.length
+        if not (0 < pos < self.length):
+            raise ValueError(
+                f"split_at expects 0 < pos < {self.length}, got {pos}"
+            )
         parent = self.parent
         new_node = RadixTreeNode(self.key_fn, self.timestamp)
         new_node.set_key_value(self._key[:pos], self._value[:pos])
@@ -163,11 +170,9 @@ def _get_key_fn(page_size: int) -> KEY_FN:
 
 
 class RadixPrefixCache(BasePrefixCache):
-    def __init__(self, device: torch.device) -> None:
-        from radixinfer.core import get_global_ctx
-        ctx = get_global_ctx()
+    def __init__(self, device: torch.device, page_size: int) -> None:
         self.device = device
-        self.page_size = ctx.page_size
+        self.page_size = page_size
         self.key_fn = _get_key_fn(self.page_size)
         self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
         self.evictable_size = 0
@@ -176,12 +181,18 @@ class RadixPrefixCache(BasePrefixCache):
         self.root_node.ref_count = 1  # root is always protected
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
-        assert isinstance(handle, RadixCacheHandle)
+        if not isinstance(handle, RadixCacheHandle):
+            raise TypeError(
+                f"RadixPrefixCache expected RadixCacheHandle, got {type(handle).__name__}"
+            )
         node = handle.node
         if unlock:
             while not node.is_root():
                 node.ref_count -= 1
-                assert node.ref_count >= 0
+                if node.ref_count < 0:
+                    raise RuntimeError(
+                        f"RadixPrefixCache ref_count underflow on node {node.uuid}"
+                    )
                 if node.ref_count == 0:
                     self.evictable_size += node.length
                     self.protected_size -= node.length
@@ -213,17 +224,25 @@ class RadixPrefixCache(BasePrefixCache):
     def evict(self, size: int) -> torch.Tensor:
         if size == 0:
             return self.empty_tensor
-        assert size <= self.evictable_size, (
-            f"Cannot evict {size}, only {self.evictable_size} is evictable"
-        )
+        if size > self.evictable_size:
+            raise RuntimeError(
+                f"Cannot evict {size}, only {self.evictable_size} is evictable"
+            )
         leaf_nodes = self._collect_evictable_leaves()
         heapq.heapify(leaf_nodes)
         evicted: list[torch.Tensor] = []
         evicted_size = 0
         while evicted_size < size:
-            assert leaf_nodes, f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
+            if not leaf_nodes:
+                raise RuntimeError(
+                    f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
+                )
             node = heapq.heappop(leaf_nodes)
-            assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
+            if node.ref_count != 0 or not node.is_leaf() or node.is_root():
+                raise RuntimeError(
+                    "Eviction candidate is invalid: "
+                    f"ref_count={node.ref_count}, is_leaf={node.is_leaf()}, is_root={node.is_root()}"
+                )
             evicted_size += node.length
             evicted.append(node.value)
             self.evictable_size -= node.length

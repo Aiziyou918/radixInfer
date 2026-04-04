@@ -118,10 +118,11 @@ class Scheduler(SchedulerIOMixin):
                 while True:
                     self.normal_loop()
         else:
-            assert torch.cuda.current_stream() == self.stream, (
-                "run_forever (overlap mode) must be entered while the scheduler "
-                "stream is current; call torch.cuda.set_stream(self.stream) first."
-            )
+            if torch.cuda.current_stream() != self.stream:
+                raise RuntimeError(
+                    "run_forever (overlap mode) must be entered while the scheduler "
+                    "stream is current; call torch.cuda.set_stream(self.stream) first."
+                )
             data = None
             while True:
                 data = self.overlap_loop(data)

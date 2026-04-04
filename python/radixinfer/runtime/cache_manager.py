@@ -32,7 +32,7 @@ class CacheManager:
         self.free_slots = (
             torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
         )
-        self.prefix_cache = _create_prefix_cache(device)
+        self.prefix_cache = _create_prefix_cache(device, page_size)
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table
@@ -117,7 +117,10 @@ class CacheManager:
         if needed_pages > free_pages:
             evicted = self.prefix_cache.evict((needed_pages - free_pages) * self.page_size)
             self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
-            assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
+            if len(self.free_slots) < needed_pages:
+                raise RuntimeError(
+                    f"Eviction did not free enough space: need {needed_pages}, have {len(self.free_slots)}"
+                )
         allocated = self.free_slots[:needed_pages]
         self.free_slots = self.free_slots[needed_pages:]
         return allocated
@@ -156,6 +159,6 @@ def _write_page_table(
     page_table[table_idxs, offsets_gpu] = allocated
 
 
-def _create_prefix_cache(device: torch.device):
+def _create_prefix_cache(device: torch.device, page_size: int):
     from radixinfer.cache.prefix_store import RadixPrefixCache
-    return RadixPrefixCache(device=device)
+    return RadixPrefixCache(device=device, page_size=page_size)

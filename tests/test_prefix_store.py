@@ -1,16 +1,10 @@
 import torch
 
-import radixinfer.core as core_mod
 from radixinfer.cache.prefix_store import RadixPrefixCache
-from radixinfer.core import Context
 
 
 def _make_cache(page_size: int = 2) -> RadixPrefixCache:
-    core_mod._GLOBAL_CTX = None
-    ctx = Context(page_size=page_size)
-    ctx.page_table = torch.empty(1, 1, dtype=torch.int32)
-    core_mod.set_global_ctx(ctx)
-    return RadixPrefixCache(device=torch.device("cpu"))
+    return RadixPrefixCache(device=torch.device("cpu"), page_size=page_size)
 
 
 def test_radix_prefix_cache_matches_page_aligned_prefix() -> None:
@@ -72,7 +66,7 @@ def test_radix_prefix_cache_rejects_invalid_handle_type() -> None:
     cache = _make_cache(page_size=2)
     try:
         cache.lock_handle(object())  # type: ignore[arg-type]
-    except AssertionError:
+    except TypeError:
         pass
     else:
         raise AssertionError("lock_handle should reject non-cache handles")

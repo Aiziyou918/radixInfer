@@ -86,9 +86,10 @@ class TokenizerProcess:
                 except Empty:
                     time.sleep(0.001)
                     continue
-                except Exception:
-                    time.sleep(0.001)
-                    continue
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Tokenizer worker failed while reading ingress queue: {type(exc).__name__}: {exc}"
+                    ) from exc
 
             # --- Collect all pending messages (non-blocking drain) ---
             pending: list = [message]

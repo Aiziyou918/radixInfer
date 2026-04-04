@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import multiprocessing as mp
 import time
 from dataclasses import dataclass, field
-from queue import Empty
 from typing import Any
 
 from radixinfer.config import ServerConfig
@@ -42,17 +40,13 @@ class ListenerHub:
 
     async def _listen(self) -> None:
         get = self.frontend_queue.get
-        is_async = inspect.iscoroutinefunction(get)
         try:
             while True:
-                if is_async:
+                if asyncio.iscoroutinefunction(get):
                     msg = await get()
                 else:
-                    try:
-                        msg = self.frontend_queue.get_nowait()
-                    except Empty:
-                        await asyncio.sleep(0.001)
-                        continue
+                    # Bridge blocking local queues into the event loop without busy polling.
+                    msg = await asyncio.to_thread(get)
                 if msg is None:
                     return
                 chunks = msg.chunks if isinstance(msg, BatchStreamChunk) else [msg]
