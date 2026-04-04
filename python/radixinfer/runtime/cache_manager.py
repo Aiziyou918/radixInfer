@@ -27,13 +27,12 @@ class CacheManager:
         num_pages: int,
         page_size: int,
         page_table: torch.Tensor,
-        cache_type: str = "radix",
     ):
         device = page_table.device
         self.free_slots = (
             torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
         )
-        self.prefix_cache = _create_prefix_cache(device, cache_type)
+        self.prefix_cache = _create_prefix_cache(device)
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table
@@ -157,6 +156,6 @@ def _write_page_table(
     page_table[table_idxs, offsets_gpu] = allocated
 
 
-def _create_prefix_cache(device: torch.device, cache_type: str):
+def _create_prefix_cache(device: torch.device):
     from radixinfer.cache.prefix_store import RadixPrefixCache
     return RadixPrefixCache(device=device)

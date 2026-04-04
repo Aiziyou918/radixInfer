@@ -58,7 +58,6 @@ class Scheduler(SchedulerIOMixin):
             engine.num_pages,
             config.page_size,
             engine.page_table,
-            getattr(config, "cache_type", "radix"),
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(

@@ -22,7 +22,6 @@ def _default_disable_overlap() -> bool:
 @dataclass(frozen=True)
 class SchedulerConfig(EngineConfig):
     max_extend_tokens: int = 8192
-    cache_type: str = "radix"
     offline_mode: bool = False
     # When True, skip overlap scheduling and run normal_loop() synchronously.
     # Controlled by RADIXINFER_DISABLE_OVERLAP_SCHEDULING env var (via ENV singleton).
