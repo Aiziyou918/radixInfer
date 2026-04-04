@@ -160,16 +160,17 @@ class Scheduler(SchedulerIOMixin):
                 raise SystemExit(0)
             self._process_new_req(msg)
 
-    def _process_new_req(self, req) -> None:
+    def _process_new_req(self, req: object) -> None:
         from radixinfer.transport.protocol import AbortRequest, TokenizedRequest
 
-        if isinstance(req, TokenizedRequest) or hasattr(req, "token_ids"):
+        if isinstance(req, TokenizedRequest):
             self.prefill_manager.add_one_req(req)
-        elif isinstance(req, AbortRequest) or hasattr(req, "request_id") and not hasattr(req, "token_ids"):
-            uid = getattr(req, "request_id", None)
-            if uid is not None:
-                self.prefill_manager.abort_req(uid)
-                self.decode_manager.abort_req(uid)
+            return
+        if isinstance(req, AbortRequest):
+            self.prefill_manager.abort_req(req.request_id)
+            self.decode_manager.abort_req(req.request_id)
+            return
+        raise TypeError(f"Unsupported scheduler message type: {type(req).__name__}")
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
