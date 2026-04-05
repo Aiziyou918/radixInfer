@@ -1,47 +1,50 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Iterable, Set
+from typing import Iterable
 
 from radixinfer.core import Batch, Req
 
 
-@dataclass
 class DecodeManager:
-    page_size: int
-    running_reqs: Set[Req] = field(default_factory=set)
+    """Tracks in-flight decode requests keyed by uid.
+
+    Using dict[uid, Req] instead of Set[Req] so that abort_req and existence
+    checks are O(1).  The sorted() in schedule_next_batch is the only O(n log n)
+    operation, and it is necessary for TP-rank determinism regardless of the
+    underlying container.
+    """
+
+    def __init__(self, page_size: int) -> None:
+        self.page_size = page_size
+        self._reqs: dict[int, Req] = {}
 
     def filter_reqs(self, reqs: Iterable[Req]) -> None:
-        """Merge new reqs into running set, dropping finished ones."""
-        self.running_reqs = {req for req in self.running_reqs.union(reqs) if req.can_decode}
+        for req in reqs:
+            self._reqs[req.uid] = req
+        finished = [uid for uid, r in self._reqs.items() if not r.can_decode]
+        for uid in finished:
+            del self._reqs[uid]
 
     def remove_req(self, req: Req) -> None:
-        self.running_reqs.discard(req)
+        self._reqs.pop(req.uid, None)
 
     def abort_req(self, uid: int) -> Req | None:
-        for req in self.running_reqs:
-            if req.uid == uid:
-                self.running_reqs.remove(req)
-                return req
-        return None
+        return self._reqs.pop(uid, None)
 
     @property
     def inflight_tokens(self) -> int:
-        """Estimate tokens reserved by in-flight decode requests (for prefill budgeting)."""
-        tokens_reserved = (self.page_size - 1) * len(self.running_reqs)
-        return sum(req.remain_len for req in self.running_reqs) + tokens_reserved
+        page_overhead = (self.page_size - 1) * len(self._reqs)
+        return sum(r.remain_len for r in self._reqs.values()) + page_overhead
 
     def schedule_next_batch(self) -> Batch | None:
-        if not self.runnable:
+        if not self._reqs:
             return None
         # Sort by uid for deterministic ordering across TP ranks.
-        # running_reqs is a set; without sorting, list() produces different
-        # orderings on rank 0 and rank 1 (different Python object ids), causing
-        # token positions to diverge, allreduce to mix incompatible tensors, and
-        # eventually NCCL seqnum desync under sustained load.
-        reqs = sorted(self.running_reqs, key=lambda r: r.uid)
+        # Without sorting, dict iteration order can differ between processes,
+        # causing token positions to diverge → allreduce mismatch → NCCL deadlock.
+        reqs = sorted(self._reqs.values(), key=lambda r: r.uid)
         return Batch(reqs=reqs, phase="decode")
 
     @property
     def runnable(self) -> bool:
-        return len(self.running_reqs) > 0
+        return bool(self._reqs)

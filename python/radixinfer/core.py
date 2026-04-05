@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal
+from typing import TYPE_CHECKING, FrozenSet, List, Literal
 
 import torch
 
@@ -20,7 +20,7 @@ class SamplingParams:
     top_p: float = 1.0
     ignore_eos: bool = False
     max_tokens: int = 1024
-    stop_token_ids: List[int] = field(default_factory=list)
+    stop_token_ids: FrozenSet[int] = field(default_factory=frozenset)
 
     @property
     def is_greedy(self) -> bool:

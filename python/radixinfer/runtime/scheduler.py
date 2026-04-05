@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-from typing import Any, NamedTuple, NoReturn, Optional, Set, Tuple, TypeAlias
+from typing import Any, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
 
@@ -30,7 +30,7 @@ ForwardData: TypeAlias = "tuple[ForwardInput, ForwardOutput]"
 
 
 class Scheduler(SchedulerIOMixin):
-    """Overlap-scheduled inference scheduler, aligned with mini-sglang Scheduler.
+    """Overlap-scheduled inference scheduler.
 
     Inherits from SchedulerIOMixin which wires up ZMQ-based (or queue-based in
     offline mode) receive_msg() / send_result() methods.
@@ -100,7 +100,7 @@ class Scheduler(SchedulerIOMixin):
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
-        # Mirror mini-sglang's two-branch design:
+        # Two-branch execution design:
         #
         # non-overlap branch:
         #   Enter engine_stream_ctx once and hold it for the entire loop so
@@ -334,7 +334,7 @@ class Scheduler(SchedulerIOMixin):
 
 
 # ---------------------------------------------------------------------------
-# Process entry-points — mirrors mini-sglang's launch.py pattern
+# Process entry-points for runtime worker launch
 # ---------------------------------------------------------------------------
 
 def _run_scheduler_process(
@@ -344,7 +344,7 @@ def _run_scheduler_process(
 ) -> None:
     """Entry point for each TP-rank subprocess.
 
-    Mirrors mini-sglang's _run_scheduler: construct Scheduler directly,
+    Construct Scheduler directly,
     barrier, ack, then run_forever().  No SchedulerRuntime bridge needed —
     the Scheduler manages its own ZMQ I/O for both TP=1 and TP>1.
     """

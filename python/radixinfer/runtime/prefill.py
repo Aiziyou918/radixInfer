@@ -134,10 +134,10 @@ class PrefillManager:
         from radixinfer.runtime.utils import PendingReq as PR
 
         sampling = req.sampling
-        stop_ids: list[int] = list(getattr(req, "stop_token_ids", ()))
+        stop_ids: set[int] = set(getattr(req, "stop_token_ids", ()))
         eos = getattr(req, "eos_token_id", None)
-        if eos is not None and eos not in stop_ids:
-            stop_ids.append(eos)
+        if eos is not None:
+            stop_ids.add(eos)
 
         sp = SamplingParams(
             temperature=sampling.temperature,
@@ -145,7 +145,7 @@ class PrefillManager:
             top_p=sampling.top_p,
             ignore_eos=sampling.ignore_eos,
             max_tokens=sampling.max_tokens,
-            stop_token_ids=stop_ids,
+            stop_token_ids=frozenset(stop_ids),
         )
         input_ids = torch.tensor(req.token_ids, dtype=torch.int32)
         self.pending_list.append(PR(uid=req.request_id, input_ids=input_ids, sampling_params=sp))

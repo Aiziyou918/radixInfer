@@ -26,4 +26,4 @@ def get_model_class(model_architecture: str, model_config: ModelConfig):
     return model_cls(model_config)
 
 
-__all__ = ["get_model_class", "_MODEL_REGISTRY"]
+__all__ = ["get_model_class"]

@@ -69,15 +69,11 @@ class BasePrefixCache(ABC):
 # ---------------------------------------------------------------------------
 
 class RadixTreeNode:
-    counter: int = 0
-
     def __init__(self, key_fn: KEY_FN, tic: int | None = None) -> None:
         self.key_fn = key_fn
         self.children: dict[Any, RadixTreeNode] = {}
         self._parent: RadixTreeNode | None = None
         self.ref_count: int = 0
-        self.uuid = RadixTreeNode.counter
-        RadixTreeNode.counter += 1
         self.timestamp = tic or time.monotonic_ns()
         self._key: torch.Tensor
         self._value: torch.Tensor
@@ -170,6 +166,20 @@ def _get_key_fn(page_size: int) -> KEY_FN:
 
 
 class RadixPrefixCache(BasePrefixCache):
+    """Radix-tree prefix cache with LRU eviction.
+
+    Eviction uses a min-heap of (timestamp, node) tuples over evictable leaf
+    nodes.  Heap entries are validated lazily on pop so that timestamp updates
+    (from cache hits in _tree_walk) and lock/unlock transitions do not require
+    O(log n) heap updates on every access — only O(log n) on eviction.
+
+    Complexity:
+      match_prefix  – O(depth * page_size)  (key_fn tuple allocation per level)
+      insert_prefix – O(depth + log h)      (h = heap size)
+      lock_handle   – O(depth * log h)
+      evict(k)      – O(k log h)  amortised (lazy deletions bounded by inserts)
+    """
+
     def __init__(self, device: torch.device, page_size: int) -> None:
         self.device = device
         self.page_size = page_size
@@ -179,6 +189,14 @@ class RadixPrefixCache(BasePrefixCache):
         self.protected_size = 0
         self.root_node = RadixTreeNode(self.key_fn)
         self.root_node.ref_count = 1  # root is always protected
+
+        # Min-heap of (timestamp_at_push, node).  Entries become stale when a
+        # node is re-locked or its timestamp is refreshed by a cache hit; they
+        # are discarded lazily when popped during eviction.
+        self._evictable_heap: list[tuple[int, RadixTreeNode]] = []
+
+    def _push_evictable(self, node: RadixTreeNode) -> None:
+        heapq.heappush(self._evictable_heap, (node.timestamp, node))
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         if not isinstance(handle, RadixCacheHandle):
@@ -191,17 +209,20 @@ class RadixPrefixCache(BasePrefixCache):
                 node.ref_count -= 1
                 if node.ref_count < 0:
                     raise RuntimeError(
-                        f"RadixPrefixCache ref_count underflow on node {node.uuid}"
+                        f"RadixPrefixCache ref_count underflow on node uuid={id(node)}"
                     )
                 if node.ref_count == 0:
                     self.evictable_size += node.length
                     self.protected_size -= node.length
+                    if node.is_leaf():
+                        self._push_evictable(node)
                 node = node.parent
         else:
             while not node.is_root():
                 if node.ref_count == 0:
                     self.evictable_size -= node.length
                     self.protected_size += node.length
+                    # Stale heap entry will be discarded lazily on next eviction.
                 node.ref_count += 1
                 node = node.parent
 
@@ -218,6 +239,7 @@ class RadixPrefixCache(BasePrefixCache):
             new_node.set_key_value(input_ids[prefix_len:], indices[prefix_len:].clone())
             new_node.set_parent(node)
             self.evictable_size += new_node.length
+            self._push_evictable(new_node)
             node = new_node
         return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
 
@@ -228,28 +250,30 @@ class RadixPrefixCache(BasePrefixCache):
             raise RuntimeError(
                 f"Cannot evict {size}, only {self.evictable_size} is evictable"
             )
-        leaf_nodes = self._collect_evictable_leaves()
-        heapq.heapify(leaf_nodes)
         evicted: list[torch.Tensor] = []
         evicted_size = 0
         while evicted_size < size:
-            if not leaf_nodes:
+            if not self._evictable_heap:
                 raise RuntimeError(
                     f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
                 )
-            node = heapq.heappop(leaf_nodes)
-            if node.ref_count != 0 or not node.is_leaf() or node.is_root():
-                raise RuntimeError(
-                    "Eviction candidate is invalid: "
-                    f"ref_count={node.ref_count}, is_leaf={node.is_leaf()}, is_root={node.is_root()}"
-                )
+            ts, node = heapq.heappop(self._evictable_heap)
+            # Lazy validity check: skip stale entries.
+            # A heap entry is stale when:
+            #   - the node was re-locked (ref_count > 0), or
+            #   - the node's timestamp was refreshed by a cache hit (ts mismatch), or
+            #   - the node gained children after insertion (no longer a leaf).
+            if ts != node.timestamp or node.ref_count != 0 or not node.is_leaf() or node.is_root():
+                continue
+
             evicted_size += node.length
             evicted.append(node.value)
             self.evictable_size -= node.length
             parent = node.parent
             del parent.children[self.key_fn(node._key)]
             if parent.is_leaf() and parent.ref_count == 0 and not parent.is_root():
-                heapq.heappush(leaf_nodes, parent)
+                self._push_evictable(parent)
+
         return torch.cat(evicted).to(self.device)
 
     @property
@@ -268,9 +292,9 @@ class RadixPrefixCache(BasePrefixCache):
         stack = [self.root_node]
         while stack:
             node = stack.pop()
-            if node.uuid in seen:
+            if id(node) in seen:
                 raise RuntimeError("RadixPrefixCache integrity check failed: cycle detected")
-            seen.add(node.uuid)
+            seen.add(id(node))
 
             if node.is_root():
                 if node._parent is not None:
@@ -325,17 +349,9 @@ class RadixPrefixCache(BasePrefixCache):
             if match_len != node.length:
                 node = node.split_at(match_len)
                 return node, prefix_len
+            # Full match: refresh timestamp for LRU.  If the node is an evictable
+            # leaf, push a fresh heap entry; the stale entry will be skipped lazily.
             node.timestamp = tic
+            if node.ref_count == 0 and node.is_leaf():
+                self._push_evictable(node)
         return node, prefix_len
-
-    def _collect_evictable_leaves(self) -> list[RadixTreeNode]:
-        stack = [self.root_node]
-        leaves: list[RadixTreeNode] = []
-        while stack:
-            n = stack.pop()
-            if n.is_leaf():
-                if n.ref_count == 0 and not n.is_root():
-                    leaves.append(n)
-            else:
-                stack.extend(n.children.values())
-        return leaves
