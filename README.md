@@ -120,6 +120,100 @@ The scheduler runs an overlap loop by default: GPU execution for batch N overlap
 - [API Guide](docs/api-guide.md) — endpoint reference with request/response shapes
 - [Development Guide](docs/development.md) — local workflow, test commands
 
+## Benchmarks
+
+> **Environment:** 2× NVIDIA RTX 4090 D (24 GB), TP=2, Qwen/Qwen3-8B (bfloat16), input 512 tokens, output 256 tokens, 200 requests per run, 8 warmup requests.
+
+### Engine Comparison at Concurrency = 16
+
+| Engine | Output (tok/s) | TTFT mean | TPOT mean | Latency p99 |
+|---|---|---|---|---|
+| radixInfer | 261.7 | 3764 ms | 45.7 ms | 17.60 s |
+| vLLM | 262.9 | 1743 ms | 53.4 ms | 20.42 s |
+| SGLang | 261.6 | 5746 ms | 37.2 ms | 16.18 s |
+
+<p align="center">
+  <img src="docs/assets/bench/comparison_c16_throughput_tps.png" width="32%" alt="Output Throughput"/>
+  <img src="docs/assets/bench/comparison_c16_ttft.png" width="32%" alt="TTFT"/>
+  <img src="docs/assets/bench/comparison_c16_tpot.png" width="32%" alt="TPOT"/>
+</p>
+
+### Concurrency Sweep
+
+Output throughput (tok/s) across concurrency levels 1 / 4 / 8 / 16 / 32:
+
+| Engine | c=1 | c=4 | c=8 | c=16 | c=32 |
+|---|---|---|---|---|---|
+| radixInfer | 77 | 177 | 222 | 262 | 287 |
+| vLLM | 77 | 176 | 224 | 263 | 286 |
+| SGLang | 78 | 176 | 222 | 262 | 284 |
+
+<p align="center">
+  <img src="docs/assets/bench/radixinfer_conc_sweep_throughput.png" width="32%" alt="radixInfer sweep"/>
+  <img src="docs/assets/bench/vllm_conc_sweep_throughput.png" width="32%" alt="vLLM sweep"/>
+  <img src="docs/assets/bench/sglang_conc_sweep_throughput.png" width="32%" alt="SGLang sweep"/>
+</p>
+
+### Burst Run (200 Requests, Concurrency = 200, Input = 512, Output = 256)
+
+All 200 requests are submitted to the engine at once to measure peak throughput under uncapped burst load.
+
+| Engine | Output (tok/s) | Requests (req/s) | TTFT mean | TPOT mean | Latency p99 |
+|---|---|---|---|---|---|
+| radixInfer | 295.8 | 1.155 | 79.20 s | 142.1 ms | 170.46 s |
+| vLLM | 286.5 | 1.119 | 81.75 s | 156.2 ms | 178.62 s |
+| SGLang | 291.5 | 1.139 | 80.13 s | 92.2 ms | 175.56 s |
+
+<p align="center">
+  <img src="docs/assets/bench/comparison_burst200_long_throughput_tps.png" width="32%" alt="Burst throughput"/>
+  <img src="docs/assets/bench/comparison_burst200_long_ttft.png" width="32%" alt="Burst TTFT"/>
+  <img src="docs/assets/bench/comparison_burst200_long_latency.png" width="32%" alt="Burst latency"/>
+</p>
+
+### Burst Run (200 Requests, Concurrency = 200, Input = 128, Output = 128)
+
+This shorter prompt/output setup shows the peak burst throughput when prefill pressure is lighter and all 200 requests are still submitted at once.
+
+| Engine | Output (tok/s) | Requests (req/s) | TTFT mean | TPOT mean | Latency p99 |
+|---|---|---|---|---|---|
+| radixInfer | 1057.7 | 8.263 | 11.35 s | 98.7 ms | 24.15 s |
+| vLLM | 1120.8 | 8.756 | 10.92 s | 89.3 ms | 22.80 s |
+| SGLang | 1123.4 | 8.776 | 10.38 s | 96.6 ms | 22.78 s |
+
+<p align="center">
+  <img src="docs/assets/bench/comparison_burst200_short_throughput_tps.png" width="32%" alt="Burst short throughput"/>
+  <img src="docs/assets/bench/comparison_burst200_short_ttft.png" width="32%" alt="Burst short TTFT"/>
+  <img src="docs/assets/bench/comparison_burst200_short_latency.png" width="32%" alt="Burst short latency"/>
+</p>
+
+### Prefix Cache Effect (radixInfer, concurrency = 16)
+
+400-token shared prefix across all requests:
+
+| | Output (tok/s) | TTFT mean |
+|---|---|---|
+| No prefix cache | 262 | 3764 ms |
+| Prefix cache hit | 1004 | 63 ms |
+
+<p align="center">
+  <img src="docs/assets/bench/prefix_cache_throughput.png" width="40%" alt="Cache throughput"/>
+  <img src="docs/assets/bench/prefix_cache_ttft.png" width="40%" alt="Cache TTFT"/>
+</p>
+
+### Input-Length Sweep (radixInfer, concurrency = 16)
+
+| Input tokens | Output (tok/s) | TTFT mean |
+|---|---|---|
+| 128 | 773 | 556 ms |
+| 512 | 267 | 3716 ms |
+| 1024 | 147 | 4374 ms |
+| 2048 | 75 | 17269 ms |
+
+<p align="center">
+  <img src="docs/assets/bench/radixinfer_input_sweep_throughput.png" width="45%" alt="Input-length throughput"/>
+  <img src="docs/assets/bench/radixinfer_input_sweep_ttft.png" width="45%" alt="Input-length TTFT"/>
+</p>
+
 ## Current Status
 
 The control plane (API, transport, scheduling, cache) is substantially complete and end-to-end runnable. Remaining work:
@@ -127,3 +221,9 @@ The control plane (API, transport, scheduling, cache) is substantially complete 
 - Real FlashAttention/FlashInfer attention backends (HF fallback currently)
 - ZMQ overlap scheduler edge cases under sustained TP load
 - Full OpenAI API compatibility (`n > 1`, broader schema coverage)
+
+## Acknowledgements
+
+- [vLLM](https://github.com/vllm-project/vllm) — production-grade LLM serving engine; used as a benchmark baseline and reference for paged KV cache design.
+- [SGLang](https://github.com/sgl-project/sglang) — high-throughput LLM serving with RadixAttention; used as a benchmark baseline and reference for radix-tree prefix reuse.
+- [mini-sglang](https://github.com/sgl-project/mini-sglang) — A compact implementation of SGLang, designed to demystify the complexities of modern LLM serving systems.

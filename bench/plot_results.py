@@ -55,6 +55,7 @@ def engine_label(path: str) -> str:
     """Derive a short label from the filename, e.g. 'vllm_c16' → 'vllm c=16'."""
     stem = Path(path).stem
     stem = re.sub(r"_c(\d+)$", r" c=\1", stem)
+    stem = re.sub(r"_burst(\d+)$", r" burst=\1", stem)
     return stem
 
 

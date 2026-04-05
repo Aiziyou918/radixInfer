@@ -1,47 +1,59 @@
 # bench — End-to-End Benchmark Suite
 
-对比 radixInfer、vLLM、SGLang 的推理性能，并生成可直接嵌入 README 的图表。
+Benchmark radixInfer, vLLM, and SGLang, and generate charts that can be embedded directly into the project README.
 
-## 文件说明
+## Files
 
-| 文件 | 说明 |
+| File | Description |
 |---|---|
-| `bench_e2e.py` | 核心压测脚本（无第三方依赖，纯标准库） |
-| `plot_results.py` | 读取 JSON 结果，生成 PNG 对比图（需要 matplotlib） |
-| `run_bench.sh` | 一键运行所有测试场景并生成图表 |
+| `bench_e2e.py` | Core benchmark driver with no third-party runtime dependencies beyond the Python standard library |
+| `plot_results.py` | Reads JSON benchmark results and generates PNG charts; requires `matplotlib` |
+| `run_bench.sh` | Runs the full benchmark suite and generates plots |
 
-## 测试场景
+## Benchmark Scenarios
 
-### Scenario 1 — 并发扫描（三引擎对比）
+### Scenario 1 — Concurrency Sweep (Three-Engine Comparison)
 
-固定输入/输出 token 数，扫描并发度 `[1, 4, 8, 16, 32]`，对比三个引擎的：
-- 输出吞吐（tokens/s）
-- TTFT（首 token 延迟）
-- TPOT（每 token 耗时）
-- 端到端延迟 p50/p90/p99
+Use fixed input/output token counts and sweep concurrency across `[1, 4, 8, 16, 32]` to compare:
 
-### Scenario 2 — 输入长度扫描（radixInfer）
+- Output throughput (tokens/s)
+- TTFT (time to first token)
+- TPOT (time per output token)
+- End-to-end latency p50/p90/p99
 
-固定并发=16，输出=256 tokens，扫描输入长度 `[128, 512, 1024, 2048]`，观察长上下文下的吞吐变化。
+### Scenario 2 — Burst / Max-Concurrency Run (Three-Engine Comparison)
 
-### Scenario 3 — 前缀缓存命中效果（radixInfer 专项）
+Use `200` total requests and set concurrency to `200` as well, so all requests are pushed into the engine at once. This is intended to measure peak throughput under an uncapped burst load and compare radixInfer, vLLM, and SGLang at the highest request fan-in for the run.
 
-所有请求共享一个 400-token 公共前缀，对比有/无缓存命中时的吞吐和 TTFT 差异。
+The default burst setting is:
 
-## 快速开始
+- `NUM_REQUESTS = 200`
+- `BURST_CONC = 200`
 
-### 1. 安装依赖
+You can override either value through environment variables when running `run_bench.sh`.
+
+### Scenario 3 — Input-Length Sweep (radixInfer)
+
+Use fixed concurrency `= 16` and output length `= 256` tokens, then sweep input length across `[128, 512, 1024, 2048]` to observe throughput changes under longer contexts.
+
+### Scenario 4 — Prefix-Cache Benefit (radixInfer)
+
+Make all requests share a common 400-token prefix and compare throughput and TTFT with and without prefix-cache hits.
+
+## Quick Start
+
+### 1. Install Dependencies
 
 ```bash
 pip install matplotlib
 ```
 
-### 2. 启动各引擎
+### 2. Start the Engines
 
-分别在三个终端中启动（均使用 Qwen3-8B + 2× RTX 4090 D TP=2）：
+Launch the three engines in separate terminals. The example below uses `Qwen3-8B` with `2x RTX 4090 D`, `TP=2` for all engines:
 
 ```bash
-# radixInfer (port 1919) — cuda:0 + cuda:1 自动分配
+# radixInfer (port 1919) — cuda:0 + cuda:1 assigned automatically
 conda activate sglang
 PYTHONPATH=python python -m radixinfer \
     --model Qwen/Qwen3-8B --tp-size 2 --device cuda:0 --port 1919
@@ -57,28 +69,28 @@ python -m sglang.launch_server \
     --port 30000 --dtype bfloat16
 ```
 
-等三个服务都 ready 后再运行压测。
+Wait until all services are ready before starting benchmarks.
 
-### 3. 运行压测
+### 3. Run Benchmarks
 
-脚本每次只测一个引擎，避免多服务同时占用显存。
+The suite benchmarks one engine at a time so multiple services do not compete for GPU memory during the same run.
 
-**手动启停模式（默认）**：脚本在每个引擎前后暂停，等待用户手动启动/停止服务。
+**Manual start/stop mode (default):** the script pauses before and after each engine and waits for you to start or stop the service manually.
 
 ```bash
-# 按提示逐个启动引擎测试（推荐）
+# Run engines one by one as prompted
 bash bench/run_bench.sh
 
-# 只测单个引擎
+# Benchmark a single engine only
 ENGINES=radixinfer bash bench/run_bench.sh
 ENGINES=vllm       bash bench/run_bench.sh
 ENGINES=sglang     bash bench/run_bench.sh
 
-# 所有结果收集完后单独出图
+# Generate plots only after all results have been collected
 bash bench/run_bench.sh --plot-only
 ```
 
-**自动启停模式**：设置 `*_CMD` 变量，脚本自动启动/杀死进程。
+**Auto start/stop mode:** set the `*_CMD` variables so the script launches and stops each service automatically.
 
 ```bash
 VLLM_CMD="python -m vllm.entrypoints.openai.api_server \
@@ -90,25 +102,41 @@ RADIXINFER_CMD="PYTHONPATH=python python -m radixinfer \
 bash bench/run_bench.sh
 ```
 
-结果写入 `bench/results/`，图表写入 `bench/results/plots/`。
+Results are written to `bench/results/`, and plots are written to `bench/results/plots/`.
 
-### 4. 单独绘图
+These benchmark outputs are runtime artifacts and should generally not be committed.
+If a chart is promoted into project documentation, copy the curated image into a stable docs asset directory such as `docs/assets/bench/`.
+
+Burst-run outputs are written with names like:
+
+- `bench/results/radixinfer_burst200.json`
+- `bench/results/vllm_burst200.json`
+- `bench/results/sglang_burst200.json`
+
+### 4. Plot Separately
 
 ```bash
-# 三引擎并发=16 快照对比
+# Snapshot comparison for all three engines at concurrency = 16
 python3 bench/plot_results.py \
     bench/results/vllm_c16.json \
     bench/results/sglang_c16.json \
     bench/results/radixinfer_c16.json \
     --out-dir bench/results/plots
 
-# 并发扫描折线图
+# Concurrency sweep line chart
 python3 bench/plot_results.py \
     --sweep bench/results/radixinfer_c*.json \
     --sweep-key concurrency \
     --out-dir bench/results/plots/radixinfer_sweep
 
-# 前缀缓存效果
+# Burst comparison
+python3 bench/plot_results.py \
+    bench/results/vllm_burst200.json \
+    bench/results/sglang_burst200.json \
+    bench/results/radixinfer_burst200.json \
+    --out-dir bench/results/plots/comparison_burst200
+
+# Prefix-cache comparison
 python3 bench/plot_results.py \
     --prefix-cache \
     bench/results/radixinfer_c16_nocache.json \
@@ -116,10 +144,10 @@ python3 bench/plot_results.py \
     --out-dir bench/results/plots/prefix_cache
 ```
 
-## 手动压测单个引擎
+## Benchmark a Single Engine Manually
 
 ```bash
-# 已启动的服务
+# Benchmark an already running service
 python3 bench/bench_e2e.py \
     --engine generic \
     --base-url http://127.0.0.1:1919/v1 \
@@ -130,7 +158,7 @@ python3 bench/bench_e2e.py \
     --output-tokens 256 \
     --result-json bench/results/radixinfer_c16.json
 
-# 自动启动服务再压测
+# Launch a service automatically and benchmark it
 python3 bench/bench_e2e.py \
     --engine vllm \
     --server-command "python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen3-0.6B --port 8000" \
@@ -141,31 +169,31 @@ python3 bench/bench_e2e.py \
     --result-json bench/results/vllm_c16.json
 ```
 
-## 关键参数
+## Key Arguments
 
-| 参数 | 说明 |
+| Argument | Description |
 |---|---|
-| `--engine` | `vllm` / `sglang` / `generic`（radixInfer 用 generic） |
-| `--base-url` | 引擎的 OpenAI 兼容 API 地址 |
-| `--concurrency` | 并发请求数 |
-| `--num-requests` | 总请求数 |
-| `--input-tokens` | 输入长度，支持范围如 `512:1024` |
-| `--output-tokens` | 输出长度，支持范围如 `128:256` |
-| `--warmup-requests` | 预热请求数（不计入结果） |
-| `--result-json` | 结果保存路径（JSON） |
-| `--result-jsonl` | 逐请求明细保存路径 |
-| `--dataset` | 使用 JSONL 数据集替代合成 prompt |
+| `--engine` | `vllm` / `sglang` / `generic` (`generic` is used for radixInfer) |
+| `--base-url` | OpenAI-compatible API base URL of the target engine |
+| `--concurrency` | Number of concurrent requests |
+| `--num-requests` | Total request count |
+| `--input-tokens` | Input length; supports ranges such as `512:1024` |
+| `--output-tokens` | Output length; supports ranges such as `128:256` |
+| `--warmup-requests` | Warmup request count; excluded from final metrics |
+| `--result-json` | Output path for JSON summary results |
+| `--result-jsonl` | Output path for per-request detail records |
+| `--dataset` | Use a JSONL dataset instead of synthetic prompts |
 
-## 测试环境
+## Test Environment
 
-| 项目 | 值 |
+| Item | Value |
 |---|---|
 | GPU | 2× NVIDIA GeForce RTX 4090 D (24 GB) |
-| TP | 2（张量并行） |
-| 模型 | Qwen/Qwen3-8B |
-| 精度 | bfloat16 |
-| 输入长度 | 512 tokens |
-| 输出长度 | 256 tokens |
-| 并发扫描 | 1 / 4 / 8 / 16 / 32 |
-| 请求数 | 200（每组） |
-| 预热 | 8 requests |
+| TP | 2 (tensor parallel) |
+| Model | Qwen/Qwen3-8B |
+| Precision | bfloat16 |
+| Input length | 512 tokens |
+| Output length | 256 tokens |
+| Concurrency sweep | 1 / 4 / 8 / 16 / 32 |
+| Requests | 200 per run |
+| Warmup | 8 requests |

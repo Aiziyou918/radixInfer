@@ -2,10 +2,10 @@
 
 ## Environment
 
-Python 3.10+ required. The conda environment is `sglang`.
+Python 3.10+ required. The conda environment is `radixInfer`.
 
 ```bash
-conda activate sglang
+conda activate radixInfer
 export PYTHONPATH=python
 ```
 

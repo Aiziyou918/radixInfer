@@ -59,6 +59,7 @@ OUTPUT_TOKENS="${OUTPUT_TOKENS:-256}"
 NUM_REQUESTS="${NUM_REQUESTS:-200}"
 WARMUP="${WARMUP:-8}"
 FIXED_CONC=16        # used for input-length and prefix-cache scenarios
+BURST_CONC="${BURST_CONC:-$NUM_REQUESTS}"   # push all requests at once by default
 
 RESULTS_DIR="bench/results"
 PLOTS_DIR="bench/results/plots"
@@ -154,14 +155,35 @@ bench_engine() {
     echo "════════════════════════════════════════"
 
     # --- Scenario 1: Concurrency sweep ---
-    echo "  [1/3] Concurrency sweep: $CONCURRENCY_LIST"
+    echo "  [1/4] Concurrency sweep: $CONCURRENCY_LIST"
     for conc in $CONCURRENCY_LIST; do
         _run "$engine" "$eng_arg" "$url" "$conc" "$INPUT_TOKENS" "$OUTPUT_TOKENS" ""
     done
 
-    # --- Scenario 2: Input-length sweep (radixinfer only) ---
+    # --- Scenario 2: Burst / max-concurrency run ---
+    echo "  [2/4] Burst run: concurrency=$BURST_CONC, requests=$NUM_REQUESTS"
+    local burst_label="${engine}_burst${BURST_CONC}"
+    local burst_out="$RESULTS_DIR/${burst_label}.json"
+    if [[ -f "$burst_out" ]]; then
+        echo "    [skip] $burst_label"
+    else
+        echo "    bench: $burst_label  (conc=$BURST_CONC  requests=$NUM_REQUESTS  in=$INPUT_TOKENS  out=$OUTPUT_TOKENS)"
+        $BENCH \
+            --engine "$eng_arg" \
+            --base-url "$url" \
+            --model "$MODEL" \
+            --concurrency "$BURST_CONC" \
+            --num-requests "$NUM_REQUESTS" \
+            --warmup-requests "$WARMUP" \
+            --input-tokens "$INPUT_TOKENS" \
+            --output-tokens "$OUTPUT_TOKENS" \
+            --result-json "$burst_out" \
+            || echo "    WARNING: $burst_label failed, continuing"
+    fi
+
+    # --- Scenario 3: Input-length sweep (radixInfer only) ---
     if [[ "$engine" == "radixinfer" ]]; then
-        echo "  [2/3] Input-length sweep: 128 512 1024 2048"
+        echo "  [3/4] Input-length sweep: 128 512 1024 2048"
         for ilen in 128 512 1024 2048; do
             local label="radixinfer_i${ilen}"
             local out="$RESULTS_DIR/${label}.json"
@@ -180,8 +202,8 @@ bench_engine() {
                 || echo "    WARNING: $label failed"
         done
 
-        # --- Scenario 3: Prefix-cache hit vs no-hit ---
-        echo "  [3/3] Prefix-cache effect"
+        # --- Scenario 4: Prefix-cache hit vs no-hit ---
+        echo "  [4/4] Prefix-cache effect"
         local nocache_out="$RESULTS_DIR/radixinfer_c${FIXED_CONC}_nocache.json"
         local cache_out="$RESULTS_DIR/radixinfer_c${FIXED_CONC}_cache.json"
 
@@ -215,8 +237,8 @@ for i in range(${NUM_REQUESTS}):
                 || echo "    WARNING: prefix-cache scenario failed"
         fi
     else
-        echo "  [2/3] Input-length sweep: skipped (radixinfer only)"
-        echo "  [3/3] Prefix-cache effect: skipped (radixinfer only)"
+        echo "  [3/4] Input-length sweep: skipped (radixinfer only)"
+        echo "  [4/4] Prefix-cache effect: skipped (radixinfer only)"
     fi
 }
 
@@ -262,6 +284,17 @@ for snap_conc in $FIXED_CONC; do
         $PLOT $snap_files --out-dir "$PLOTS_DIR/comparison_c${snap_conc}"
     fi
 done
+
+# 1b. Burst comparison
+burst_files=""
+for engine in $ENGINES; do
+    f="$RESULTS_DIR/${engine}_burst${BURST_CONC}.json"
+    [[ -f "$f" ]] && burst_files="$burst_files $f"
+done
+if [[ -n "$burst_files" ]]; then
+    echo "  burst comparison (concurrency=$BURST_CONC)..."
+    $PLOT $burst_files --out-dir "$PLOTS_DIR/comparison_burst${BURST_CONC}"
+fi
 
 # 2. Concurrency sweep line charts per engine
 for engine in $ENGINES; do
