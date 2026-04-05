@@ -38,28 +38,37 @@ pip install matplotlib
 
 ### 2. 启动各引擎
 
+分别在三个终端中启动（均使用 Qwen3-8B + 2× RTX 4090 D TP=2）：
+
 ```bash
-# radixInfer (port 1919)
+# radixInfer (port 1919) — cuda:0 + cuda:1 自动分配
 conda activate sglang
-PYTHONPATH=python python -m radixinfer --model Qwen/Qwen3-0.6B --device cuda:0 --port 1919
+PYTHONPATH=python python -m radixinfer \
+    --model Qwen/Qwen3-8B --tp-size 2 --device cuda:0 --port 1919
 
 # vLLM (port 8000)
 python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen3-0.6B --port 8000 --dtype bfloat16
+    --model Qwen/Qwen3-8B --tensor-parallel-size 2 \
+    --port 8000 --dtype bfloat16
 
 # SGLang (port 30000)
 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-0.6B --port 30000 --dtype bfloat16
+    --model-path Qwen/Qwen3-8B --tp-size 2 \
+    --port 30000 --dtype bfloat16
 ```
+
+等三个服务都 ready 后再运行压测。
 
 ### 3. 一键运行
 
 ```bash
 cd /path/to/radixInfer
 
-MODEL=Qwen/Qwen3-0.6B \
-NUM_REQUESTS=200 \
+# 默认 MODEL=Qwen/Qwen3-8B，服务已在 8000/30000/1919 就绪
 bash bench/run_bench.sh
+
+# 只测单个引擎
+ENGINES=radixinfer bash bench/run_bench.sh
 ```
 
 结果写入 `bench/results/`，图表写入 `bench/results/plots/`。
@@ -132,9 +141,12 @@ python3 bench/bench_e2e.py \
 
 | 项目 | 值 |
 |---|---|
-| GPU | 2× NVIDIA RTX 4090 D (24GB) |
-| 模型 | Qwen/Qwen3-0.6B（对比用）|
+| GPU | 2× NVIDIA GeForce RTX 4090 D (24 GB) |
+| TP | 2（张量并行） |
+| 模型 | Qwen/Qwen3-8B |
+| 精度 | bfloat16 |
 | 输入长度 | 512 tokens |
 | 输出长度 | 256 tokens |
-| 请求数 | 200 |
+| 并发扫描 | 1 / 4 / 8 / 16 / 32 |
+| 请求数 | 200（每组） |
 | 预热 | 8 requests |

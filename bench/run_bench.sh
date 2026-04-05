@@ -17,21 +17,21 @@ set -euo pipefail
 # Configuration (override via environment variables)
 # ---------------------------------------------------------------------------
 
-MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
+MODEL="${MODEL:-Qwen/Qwen3-8B}"
 ENGINES="${ENGINES:-vllm sglang radixinfer}"
 
 VLLM_URL="${VLLM_URL:-http://127.0.0.1:8000/v1}"
 SGLANG_URL="${SGLANG_URL:-http://127.0.0.1:30000/v1}"
 RADIXINFER_URL="${RADIXINFER_URL:-http://127.0.0.1:1919/v1}"
 
-# Server launch commands (leave empty to skip auto-start)
+# Server launch commands (leave empty = assume server already running)
 VLLM_CMD="${VLLM_CMD:-}"
 SGLANG_CMD="${SGLANG_CMD:-}"
 RADIXINFER_CMD="${RADIXINFER_CMD:-}"
 
 READY_TIMEOUT="${READY_TIMEOUT:-300}"
 
-# Benchmark parameters
+# Benchmark parameters — tuned for Qwen3-8B on 2× RTX 4090 D
 CONCURRENCY_LIST="${CONCURRENCY_LIST:-1 4 8 16 32}"
 INPUT_TOKENS="${INPUT_TOKENS:-512}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-256}"
