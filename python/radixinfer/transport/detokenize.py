@@ -1,7 +1,7 @@
 """Incremental detokenization with per-request state management.
 
-Ported from mini-sglang (sglang origin). Handles UTF-8 boundaries and CJK characters
-so streaming output never emits incomplete multi-byte sequences.
+Handles UTF-8 boundaries and CJK characters so streaming output never emits
+incomplete multi-byte sequences.
 """
 from __future__ import annotations
 
