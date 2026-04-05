@@ -113,10 +113,11 @@ _stop_server() {
 }
 
 _run() {
-    # _run <engine> <url> <concurrency> <input_tokens> <output_tokens> <tag> [extra bench args...]
-    local engine="$1" url="$2" conc="$3" itok="$4" otok="$5" tag="$6"
-    shift 6
-    local label="${engine}_c${conc}${tag}"
+    # _run <label_prefix> <eng_arg> <url> <concurrency> <input_tokens> <output_tokens> <tag>
+    # label_prefix : name used for the result file (e.g. "radixinfer")
+    # eng_arg      : value passed to --engine (generic / vllm / sglang)
+    local label_prefix="$1" eng_arg="$2" url="$3" conc="$4" itok="$5" otok="$6" tag="$7"
+    local label="${label_prefix}_c${conc}${tag}"
     local out="$RESULTS_DIR/${label}.json"
 
     if [[ -f "$out" ]]; then
@@ -125,7 +126,7 @@ _run() {
     fi
     echo "    bench: $label  (conc=$conc  in=$itok  out=$otok)"
     $BENCH \
-        --engine "$engine" \
+        --engine "$eng_arg" \
         --base-url "$url" \
         --model "$MODEL" \
         --concurrency "$conc" \
@@ -134,7 +135,6 @@ _run() {
         --input-tokens "$itok" \
         --output-tokens "$otok" \
         --result-json "$out" \
-        "$@" \
         || echo "    WARNING: $label failed, continuing"
 }
 
@@ -156,7 +156,7 @@ bench_engine() {
     # --- Scenario 1: Concurrency sweep ---
     echo "  [1/3] Concurrency sweep: $CONCURRENCY_LIST"
     for conc in $CONCURRENCY_LIST; do
-        _run "$engine" "$url" "$conc" "$INPUT_TOKENS" "$OUTPUT_TOKENS" "" --engine "$eng_arg"
+        _run "$engine" "$eng_arg" "$url" "$conc" "$INPUT_TOKENS" "$OUTPUT_TOKENS" ""
     done
 
     # --- Scenario 2: Input-length sweep (radixinfer only) ---
