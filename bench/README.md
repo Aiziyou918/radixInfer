@@ -59,16 +59,35 @@ python -m sglang.launch_server \
 
 等三个服务都 ready 后再运行压测。
 
-### 3. 一键运行
+### 3. 运行压测
+
+脚本每次只测一个引擎，避免多服务同时占用显存。
+
+**手动启停模式（默认）**：脚本在每个引擎前后暂停，等待用户手动启动/停止服务。
 
 ```bash
-cd /path/to/radixInfer
-
-# 默认 MODEL=Qwen/Qwen3-8B，服务已在 8000/30000/1919 就绪
+# 按提示逐个启动引擎测试（推荐）
 bash bench/run_bench.sh
 
 # 只测单个引擎
 ENGINES=radixinfer bash bench/run_bench.sh
+ENGINES=vllm       bash bench/run_bench.sh
+ENGINES=sglang     bash bench/run_bench.sh
+
+# 所有结果收集完后单独出图
+bash bench/run_bench.sh --plot-only
+```
+
+**自动启停模式**：设置 `*_CMD` 变量，脚本自动启动/杀死进程。
+
+```bash
+VLLM_CMD="python -m vllm.entrypoints.openai.api_server \
+              --model Qwen/Qwen3-8B --tensor-parallel-size 2 --port 8000 --dtype bfloat16" \
+SGLANG_CMD="python -m sglang.launch_server \
+              --model-path Qwen/Qwen3-8B --tp-size 2 --port 30000 --dtype bfloat16" \
+RADIXINFER_CMD="PYTHONPATH=python python -m radixinfer \
+              --model Qwen/Qwen3-8B --tp-size 2 --device cuda:0 --port 1919" \
+bash bench/run_bench.sh
 ```
 
 结果写入 `bench/results/`，图表写入 `bench/results/plots/`。
