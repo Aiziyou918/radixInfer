@@ -136,6 +136,9 @@ Qwen3ForCausalLM = build_decoder_model({"has_qk_norm": True})
 - [开发者指南](docs/developer-guide.md) — 模块内部实现、阅读路径
 - [API 参考](docs/api-guide.md) — 接口请求/响应格式
 - [开发工作流](docs/development.md) — 本地运行、测试命令
+- [贡献指南](CONTRIBUTING.md) — 开发与 PR 约定
+- [安全策略](SECURITY.md) — 漏洞报告方式
+- [行为准则](CODE_OF_CONDUCT.md) — 协作规范
 
 ## 性能测试
 

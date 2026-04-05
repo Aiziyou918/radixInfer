@@ -119,6 +119,9 @@ The scheduler runs an overlap loop by default: GPU execution for batch N overlap
 - [Developer Guide](docs/developer-guide.md) — internals, module descriptions, reading order
 - [API Guide](docs/api-guide.md) — endpoint reference with request/response shapes
 - [Development Guide](docs/development.md) — local workflow, test commands
+- [Contributing](CONTRIBUTING.md) — development and pull request guidelines
+- [Security Policy](SECURITY.md) — how to report vulnerabilities
+- [Code of Conduct](CODE_OF_CONDUCT.md) — collaboration expectations
 
 ## Benchmarks
 
