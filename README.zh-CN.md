@@ -39,6 +39,18 @@
 
 Python 3.10+。核心依赖：`fastapi`、`pyzmq`、`torch`、`transformers>=4.40`、`uvicorn`、`pydantic>=2.0`。
 
+本地安装项目：
+
+```bash
+pip install -e .
+```
+
+安装开发环境：
+
+```bash
+pip install -e .[dev]
+```
+
 ### 启动服务
 
 ```bash

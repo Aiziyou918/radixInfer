@@ -39,6 +39,18 @@ Main packages under `python/radixinfer`:
 
 Python 3.10+. Core dependencies: `fastapi`, `pyzmq`, `torch`, `transformers>=4.40`, `uvicorn`, `pydantic>=2.0`.
 
+Install the package locally:
+
+```bash
+pip install -e .
+```
+
+Install the development environment:
+
+```bash
+pip install -e .[dev]
+```
+
 ### Run the Server
 
 ```bash
