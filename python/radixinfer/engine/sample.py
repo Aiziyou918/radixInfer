@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List
 import torch
 
 from radixinfer.utils import nvtx_annotate
+from radixinfer.utils.arch import is_sm90_supported
 
 if TYPE_CHECKING:
     from radixinfer.core import Batch
@@ -31,7 +32,9 @@ def sample_impl(
     try:
         import flashinfer.sampling as sampling
 
-        probs = sampling.softmax(logits, temperatures)
+        # enable_pdl activates persistent dynamic launch on SM90+ (H100/H800),
+        # which improves throughput by overlapping memory and compute.
+        probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
         if top_k is None and top_p is None:
             return sampling.sampling_from_probs(probs)
         if top_p is None:
@@ -40,7 +43,7 @@ def sample_impl(
             return sampling.top_p_sampling_from_probs(probs, top_p)
         return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
     except ImportError:
-        # Fallback: pure torch temperature sampling
+        # Torch fallback: supports CPU/debug mode without flashinfer installed.
         scaled = logits / temperatures.unsqueeze(-1).clamp(min=1e-6)
         if top_k is not None:
             k = int(top_k.min().item()) if isinstance(top_k, torch.Tensor) else top_k

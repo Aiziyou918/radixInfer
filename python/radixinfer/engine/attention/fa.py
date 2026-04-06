@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
@@ -34,6 +34,7 @@ class FAMetadata(BaseAttnMetadata):
 class FlashAttentionBackend(BaseAttnBackend):
     def __init__(self, config: "ModelConfig") -> None:
         from radixinfer.core import get_global_ctx
+        from radixinfer.utils.arch import is_sm100_supported
 
         ctx = get_global_ctx()
         self.config = config
@@ -43,12 +44,8 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.max_graph_bs = 0
         self.capture_bs: List[int] = []
         self.scale = config.head_dim ** -0.5
-        try:
-            from radixinfer.utils.arch import is_sm100_supported
-
-            self.version = 4 if is_sm100_supported() else 3
-        except ImportError:
-            self.version = 3
+        # FA4 on Blackwell (SM100), FA3 on Hopper/Ada (SM90/SM89).
+        self.version = 4 if is_sm100_supported() else 3
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: "Batch"
@@ -132,6 +129,7 @@ class FlashAttentionBackend(BaseAttnBackend):
     def prepare_for_replay(self, batch: "Batch") -> None:
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, FAMetadata) and self.capture is not None
+        # cu_seqlens_q is always [0,1,...,bs] for decode — no update needed.
         table_len = metadata.page_table.size(1)
         self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k)
         self.capture.seq_lens[:bs].copy_(metadata.cache_seqlens)
@@ -139,27 +137,48 @@ class FlashAttentionBackend(BaseAttnBackend):
 
 
 def _fa_impl(
-    q, k_cache, v_cache, page_table, cache_seqlens,
-    cu_seqlens_q, cu_seqlens_k, max_seqlen_q, softmax_scale, version,
-):
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    version: int,
+    *,
+    sm_margin: int = 0,
+    window_size: Tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
+    num_splits: int = 0,
+    pack_gqa: bool | None = None,
+    causal: bool = True,
+) -> torch.Tensor:
     try:
         from sgl_kernel.flash_attn import flash_attn_with_kvcache
-
-        return flash_attn_with_kvcache(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k_new=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            softmax_scale=softmax_scale,
-            causal=True,
-            ver=version,
-        )
     except ImportError as exc:
         raise ImportError(
             "sgl_kernel is required for FlashAttentionBackend. "
-            "Install with: pip install sgl-kernel"
+            "Install with: pip install sgl-kernel\n"
+            "If already installed, try: apt update && apt install libnuma1"
         ) from exc
+
+    return flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k_new=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        softmax_scale=softmax_scale,
+        sm_margin=sm_margin,
+        window_size=window_size,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        causal=causal,
+        ver=version,
+    )

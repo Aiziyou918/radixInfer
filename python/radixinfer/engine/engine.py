@@ -22,16 +22,38 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
-def _align_up_32(num: int) -> int:
-    return (num + 31) // 32 * 32
+class CacheAllocation(NamedTuple):
+    """Result of KV-cache memory planning."""
+    num_pages: int
+    num_tokens: int   # num_pages * page_size
+    kv_bytes: int     # actual GPU bytes consumed
+
+
+class MemoryImbalanceError(RuntimeError):
+    """Free GPU memory differs by more than 2 GiB across TP ranks."""
+
+
+def _align_up_32(n: int) -> int:
+    return (n + 31) // 32 * 32
 
 
 class Engine:
-    def __init__(self, config: EngineConfig):
-        assert not torch.cuda.is_initialized(), "CUDA must not be initialized before Engine"
+    """Single-rank inference engine: model + KV cache + CUDA graphs.
+
+    Initialisation is broken into explicit phases so each resource is easy
+    to trace, profile, or mock in tests.  Call ``shutdown()`` when done to
+    release GPU and distributed resources in the right order.
+    """
+
+    def __init__(self, config: EngineConfig) -> None:
+        assert not torch.cuda.is_initialized(), (
+            "CUDA must not be initialised before Engine.__init__. "
+            "Move all torch.cuda calls inside Engine or its workers."
+        )
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _adjust_config(config)
 
+        # ── Phase 1: device & stream ─────────────────────────────────────
         gpu_id = config.device_id if config.device_id is not None else config.tp_info.rank
         self.device = torch.device(f"cuda:{gpu_id}")
         torch.cuda.set_device(self.device)
@@ -39,64 +61,178 @@ class Engine:
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
+
+        # ── Phase 2: global inference context ────────────────────────────
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
-        self.tp_cpu_group = self._init_communication(config)
-        init_free_memory = self._sync_get_memory()[1]
-        if config.tp_info.is_primary():
-            print(f"Free memory before model load: {mem_GB(init_free_memory)}")
+        # ── Phase 3: inter-rank communication ────────────────────────────
+        self._tp_cpu_group = self._setup_communication(config)
+        pre_load_free = self._query_free_memory()
+        self._log(config, f"Free memory before model load: {mem_GB(pre_load_free)}")
 
-        # Model
+        # ── Phase 4: model weights ───────────────────────────────────────
+        self._setup_model(config)
+
+        # ── Phase 5: KV cache & page table ──────────────────────────────
+        alloc = self._setup_kvcache(config, pre_load_free)
+        self._log(
+            config,
+            f"KV cache: {alloc.num_tokens} tokens, "
+            f"{mem_GB(alloc.kv_bytes)} "
+            f"({alloc.num_pages} pages × {config.page_size} tokens/page)",
+        )
+
+        # ── Phase 6: attention & MoE backends ───────────────────────────
+        self._setup_backends(config)
+
+        # ── Phase 7: sampler ────────────────────────────────────────────
+        self.sampler = Sampler(self.device, config.model_config.vocab_size)
+
+        post_init_free = self._query_free_memory(reset_peak=False)
+        self._log(config, f"Free memory after initialisation: {mem_GB(post_init_free)}")
+
+        # ── Phase 8: CUDA graph capture ─────────────────────────────────
+        self._setup_graph_runner(config, pre_load_free, alloc)
+
+    # ------------------------------------------------------------------
+    # Logging helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _log(config: EngineConfig, msg: str) -> None:
+        if config.tp_info.is_primary():
+            print(f"[radixinfer] {msg}")
+
+    # ------------------------------------------------------------------
+    # Phase implementations
+    # ------------------------------------------------------------------
+
+    def _setup_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        """Initialise the distributed process group and optionally pynccl."""
+        timeout = timedelta(seconds=config.distributed_timeout)
+        if config.tp_info.size == 1 or config.use_pynccl:
+            torch.distributed.init_process_group(
+                backend="gloo",
+                rank=config.tp_info.rank,
+                world_size=config.tp_info.size,
+                timeout=timeout,
+                init_method=config.distributed_addr,
+            )
+            cpu_group = torch.distributed.group.WORLD
+            assert cpu_group is not None
+            # pynccl buffer covers the largest possible activation tensor.
+            max_bytes = (
+                config.max_forward_len
+                * config.model_config.hidden_size
+                * self.dtype.itemsize
+            )
+            enable_pynccl_distributed(config.tp_info, cpu_group, max_bytes)
+        else:
+            torch.distributed.init_process_group(
+                backend="nccl",
+                rank=config.tp_info.rank,
+                world_size=config.tp_info.size,
+                timeout=timeout,
+                init_method=config.distributed_addr,
+            )
+            cpu_group = torch.distributed.new_group(backend="gloo")
+            assert cpu_group is not None
+        return cpu_group
+
+    def _setup_model(self, config: EngineConfig) -> None:
+        """Allocate model on meta device then materialise weights."""
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
-        self.model.load_state_dict(self._load_weight_state_dict(config))
+        self.model.load_state_dict(self._load_weights(config))
 
-        # KV cache
-        self.num_pages = self._determine_num_pages(init_free_memory, config)
-        num_tokens = self.num_pages * config.page_size
+    def _load_weights(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
+        if config.use_dummy_weight:
+            # Random initialisation for benchmarking / CI without real checkpoints.
+            return {
+                k: torch.randn_like(v, device=self.device)
+                for k, v in self.model.state_dict().items()
+            }
+        return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+
+    def _setup_kvcache(self, config: EngineConfig, pre_load_free: int) -> CacheAllocation:
+        """Allocate the paged KV cache and the global page-address table."""
         from radixinfer.cache.kv_pool import MHAKVCache
+
+        alloc = self._plan_cache(config, pre_load_free)
+        self.num_pages = alloc.num_pages
 
         kv_cache = MHAKVCache(
             num_kv_heads=config.model_config.num_kv_heads,
             num_layers=config.model_config.num_layers,
             head_dim=config.model_config.head_dim,
-            num_pages=self.num_pages + 1,  # +1 for dummy page
+            num_pages=alloc.num_pages + 1,   # +1 for the dummy/out-of-range page
             page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
         )
         self.ctx.kv_cache = self.kv_cache = kv_cache
 
-        # Page table: shape (max_running_req + 1, aligned_max_seq_len)
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = _align_up_32(self.max_seq_len)
+        # Page table: one row per request slot (+ 1 dummy), width = aligned max seq len.
+        # Every entry stores a raw token position (page_size == 1) or a page index.
+        self.max_seq_len = min(config.max_seq_len, alloc.num_tokens)
+        self._aligned_max_seq_len = _align_up_32(self.max_seq_len)
         self.ctx.page_table = self.page_table = torch.zeros(
-            (config.max_running_req + 1, aligned_max_seq_len),
+            (config.max_running_req + 1, self._aligned_max_seq_len),
             dtype=torch.int32,
             device=self.device,
         )
+        return alloc
 
-        # Attention backend
+    def _plan_cache(self, config: EngineConfig, pre_load_free: int) -> CacheAllocation:
+        """Decide how many KV pages to allocate, returning a CacheAllocation."""
+        post_load_free = self._query_free_memory()
+        bytes_per_page = (
+            2  # key + value
+            * config.model_config.head_dim
+            * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
+            * config.page_size
+            * self.dtype.itemsize
+            * config.model_config.num_layers
+        )
+
+        if config.num_page_override is not None:
+            num_pages = config.num_page_override
+        else:
+            model_bytes = pre_load_free - post_load_free
+            available = int(config.memory_ratio * pre_load_free) - model_bytes
+            num_pages = available // bytes_per_page
+
+        if num_pages <= 1:
+            raise RuntimeError(
+                f"Not enough GPU memory for KV cache (computed {num_pages} pages). "
+                "Try --memory-ratio / --num-pages, or reduce --max-running-req."
+            )
+        return CacheAllocation(
+            num_pages=num_pages,
+            num_tokens=num_pages * config.page_size,
+            kv_bytes=num_pages * bytes_per_page,
+        )
+
+    def _setup_backends(self, config: EngineConfig) -> None:
+        """Attach attention and (optionally) MoE backends to the context."""
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
-
-        # MoE backend (only for MoE models)
         if config.model_config.is_moe:
             from radixinfer.moe import create_moe_backend
-            moe_backend_name = config.moe_backend if config.moe_backend != "auto" else "fused"
-            self.ctx.moe_backend = self.moe_backend = create_moe_backend(moe_backend_name)
 
-        # Sampler
-        self.sampler = Sampler(self.device, config.model_config.vocab_size)
+            moe_name = config.moe_backend if config.moe_backend != "auto" else "fused"
+            self.ctx.moe_backend = self.moe_backend = create_moe_backend(moe_name)
 
-        post_free_memory = self._sync_get_memory()[0]
-        if config.tp_info.is_primary():
-            print(f"Free memory after initialization: {mem_GB(post_free_memory)}")
-
-        # Dummy request for graph padding
+    def _setup_graph_runner(
+        self,
+        config: EngineConfig,
+        pre_load_free: int,
+        alloc: CacheAllocation,
+    ) -> None:
+        """Create the dummy request, wire the dummy page slot, capture graphs."""
         self.dummy_req = Req(
             input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
             table_idx=config.max_running_req,
@@ -105,9 +241,9 @@ class Engine:
             uid=-1,
             sampling_params=None,  # type: ignore
         )
-        self.page_table[self.dummy_req.table_idx].fill_(num_tokens)
+        # Dummy slot points just past valid pages — reads return zeros via padding.
+        self.page_table[self.dummy_req.table_idx].fill_(alloc.num_tokens)
 
-        # CUDA Graph
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -115,94 +251,57 @@ class Engine:
             attn_backend=self.attn_backend,
             cuda_graph_bs=config.cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
-            free_memory=init_free_memory,
-            max_seq_len=aligned_max_seq_len,
+            free_memory=pre_load_free,
+            max_seq_len=self._aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             max_running_req=config.max_running_req,
         )
 
-    def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
-        if config.tp_info.size == 1 or config.use_pynccl:
-            torch.distributed.init_process_group(
-                backend="gloo",
-                rank=config.tp_info.rank,
-                world_size=config.tp_info.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
-            )
-            tp_cpu_group = torch.distributed.group.WORLD
-            assert tp_cpu_group is not None
-            max_bytes = (
-                config.max_forward_len
-                * config.model_config.hidden_size
-                * self.dtype.itemsize
-            )
-            enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
-        else:
-            torch.distributed.init_process_group(
-                backend="nccl",
-                rank=config.tp_info.rank,
-                world_size=config.tp_info.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
-            )
-            tp_cpu_group = torch.distributed.new_group(backend="gloo")
-            assert tp_cpu_group is not None
-        return tp_cpu_group
+    # ------------------------------------------------------------------
+    # Memory snapshot
+    # ------------------------------------------------------------------
 
-    def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
-        if config.use_dummy_weight:
-            return {
-                k: torch.randn_like(v, device=self.device)
-                for k, v in self.model.state_dict().items()
-            }
-        return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+    def _query_free_memory(self, *, reset_peak: bool = True) -> int:
+        """Sync, flush cache, then return the worst-case free memory across TP ranks.
 
-    def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
-        new_free_memory = self._sync_get_memory()[1]
-        cache_per_page = (
-            2  # key + value
-            * config.model_config.head_dim
-            * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
-            * config.page_size
-            * self.dtype.itemsize
-            * config.model_config.num_layers
-        )
-        if config.num_page_override is not None:
-            num_pages = config.num_page_override
-        else:
-            model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
-            num_pages = available_memory // cache_per_page
-
-        assert num_pages > 1, "Insufficient memory for KV cache. Try --memory-ratio or --num-pages."
-        num_tokens = num_pages * config.page_size
-        real_kv_size = num_pages * cache_per_page
-        if config.tp_info.is_primary():
-            print(f"KV cache: {num_tokens} tokens, {mem_GB(real_kv_size)}")
-        return num_pages
-
-    def _sync_get_memory(self) -> Tuple[int, int]:
+        Uses a single all_reduce over [free, -free] to get both min and max
+        in one collective.  Raises ``MemoryImbalanceError`` if ranks diverge
+        by more than 2 GiB (typically indicates mis-matched model sharding or
+        a different GPU variant in the pool).
+        """
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
-        free_memory = get_free_memory(self.device)
-        mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
+        if reset_peak:
+            torch.cuda.reset_peak_memory_stats(self.device)
+        local_free = get_free_memory(self.device)
+
+        probe = torch.tensor([local_free, -local_free], device="cpu", dtype=torch.int64)
         torch.distributed.all_reduce(
-            mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+            probe, op=torch.distributed.ReduceOp.MIN, group=self._tp_cpu_group
         )
-        min_free = int(mem_tensor[0].item())
-        max_free = -int(mem_tensor[1].item())
-        if max_free - min_free > 2 * 1024 * 1024 * 1024:
-            raise RuntimeError(
-                f"Memory imbalanced across TP ranks: "
-                f"min={mem_GB(min_free)}, max={mem_GB(max_free)}"
+        min_free = int(probe[0].item())
+        max_free = -int(probe[1].item())
+
+        if max_free - min_free > 2 * 1024 ** 3:
+            raise MemoryImbalanceError(
+                f"GPU memory is severely imbalanced across TP ranks "
+                f"(min={mem_GB(min_free)}, max={mem_GB(max_free)}). "
+                "Verify that all ranks use the same GPU model and that no "
+                "other process has occupied VRAM on one of the devices."
             )
-        return min_free, max_free
+        # Return the minimum — we must size the cache to the tightest rank.
+        return min_free
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
 
     @torch.inference_mode()
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
-        assert torch.cuda.current_stream() == self.stream
+        assert torch.cuda.current_stream() == self.stream, (
+            "forward_batch must run on the engine's dedicated CUDA stream"
+        )
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
@@ -213,36 +312,49 @@ class Engine:
             req.complete_one()
 
         next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+        # Async D→H copy; caller waits on copy_done_event before reading CPU tensor.
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
+    # ------------------------------------------------------------------
+    # Teardown
+    # ------------------------------------------------------------------
+
     def shutdown(self) -> None:
+        # CUDA graphs must be destroyed before NCCL/pynccl resources are freed;
+        # otherwise the process can hang waiting on pending collective ops.
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
 
+# ------------------------------------------------------------------
+# Config post-processing
+# ------------------------------------------------------------------
+
 def _adjust_config(config: EngineConfig) -> None:
-    def override(attr: str, value: Any):
+    """Fill in 'auto' fields after hardware detection."""
+
+    def _set(attr: str, value: Any) -> None:
         object.__setattr__(config, attr, value)
 
     if config.attention_backend == "auto":
-        try:
-            from radixinfer.utils.arch import is_sm90_supported, is_sm100_supported
+        from radixinfer.utils.arch import is_sm90_supported, is_sm100_supported
 
-            if is_sm100_supported():
-                backend = "fa"  # trtllm not yet integrated
-            elif is_sm90_supported():
-                backend = "fa,fi"
-            else:
-                backend = "fi"
-        except ImportError:
+        if is_sm100_supported():
+            # Blackwell: FA4 handles both prefill and decode well.
+            backend = "fa"
+        elif is_sm90_supported():
+            # Hopper: FA3 for prefill (variable length), FI for decode (fixed shape).
+            backend = "fa,fi"
+        else:
+            # Pre-Hopper: FlashInfer only (FA3 not supported).
             backend = "fi"
-        override("attention_backend", backend)
+        _set("attention_backend", backend)
         if config.tp_info.is_primary():
-            print(f"Auto-selected attention backend: {backend}")
+            print(f"[radixinfer] Auto attention backend: {backend}")
 
     if config.moe_backend == "auto":
-        override("moe_backend", "fused")
+        _set("moe_backend", "fused")

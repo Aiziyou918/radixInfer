@@ -81,7 +81,7 @@ class Scheduler(SchedulerIOMixin):
         self._write_pos_buf = torch.empty(_max_reqs, dtype=torch.int64, pin_memory=True)
 
         # Set up I/O via mixin (ZMQ for production, queue.Queue for offline/tests)
-        SchedulerIOMixin.__init__(self, config, tp_cpu_group=tp_cpu_group or engine.tp_cpu_group)
+        SchedulerIOMixin.__init__(self, config, tp_cpu_group=tp_cpu_group or engine._tp_cpu_group)
 
     def enqueue(self, request) -> None:
         """Put a tokenized request into the offline input queue (offline mode only)."""

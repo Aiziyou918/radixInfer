@@ -4,6 +4,14 @@
 
 `radixInfer` 是一个分层清晰的 LLM Serving 系统，具备可运行的端到端控制平面。它将 API 处理、传输层、运行时调度、缓存管理和执行引擎明确拆分。
 
+## 上游来源说明
+
+本项目包含基于 [mini-sglang](https://github.com/sgl-project/mini-sglang) 演化而来的代码与设计思路。`mini-sglang` 是一个用于解释现代 LLM Serving 系统核心机制的紧凑实现。
+
+- 上游 `mini-sglang` 项目采用 MIT License。
+- `radixInfer` 在此基础上进行了较大幅度的修改、重构和功能扩展。
+- 具体的归属与许可证说明见 [NOTICE](/home/hyp/radixInfer/radixInfer/NOTICE)。
+
 ## 功能特性
 
 - 基于 FastAPI 的 HTTP 服务，支持 SSE 流式输出

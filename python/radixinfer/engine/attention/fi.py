@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, Dict, List, Literal
 
 import torch
@@ -20,7 +21,16 @@ def _next_power_of_2(n: int) -> int:
 
 @dataclass
 class FICaptureData(BaseCaptureData):
-    indices: torch.Tensor
+    """CUDA-graph capture buffers for FlashInfer decode.
+
+    ``page_table`` is reshaped to 1-D on first use so it doubles as the
+    flat paged-KV index buffer expected by ``CUDAGraphBatchDecodeWithPagedKVCacheWrapper``.
+    ``indices`` and ``one_tensor`` are aliases to avoid extra allocations.
+    """
+
+    @property
+    def indices(self) -> torch.Tensor:
+        return self.page_table
 
     @property
     def one_tensor(self) -> torch.Tensor:
@@ -29,20 +39,29 @@ class FICaptureData(BaseCaptureData):
 
 @dataclass
 class FIMetadata(BaseAttnMetadata):
-    cu_seqlens_q_cpu: torch.Tensor
-    cu_seqlens_k_cpu: torch.Tensor
-    cu_seqlens_q_gpu: torch.Tensor
-    indices: torch.Tensor
-    last_page_len_cpu: torch.Tensor
+    cu_seqlens_q_cpu: torch.Tensor   # CPU
+    cu_seqlens_k_cpu: torch.Tensor   # CPU
+    cu_seqlens_q_gpu: torch.Tensor   # GPU
+    indices: torch.Tensor            # GPU — flat paged-KV indices
+    last_page_len_cpu: torch.Tensor  # CPU
     num_qo_heads: int
     num_kv_heads: int
     head_dim: int
     page_size: Literal[1]
     pos_encoding_mode: str
-    seq_lens_cpu: torch.Tensor
+    seq_lens_cpu: torch.Tensor       # CPU
     dtype: torch.dtype
     wrapper: object
     initialized: bool = False
+
+    def __post_init__(self) -> None:
+        assert self.page_size == 1, "FlashInfer backend requires page_size == 1"
+        assert self.cu_seqlens_k_cpu.is_cpu
+        assert self.cu_seqlens_q_cpu.is_cpu
+        assert self.cu_seqlens_q_gpu.is_cuda
+        assert self.indices.is_cuda
+        assert self.last_page_len_cpu.is_cpu
+        assert self.seq_lens_cpu.is_cpu
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
@@ -70,10 +89,11 @@ class FlashInferBackend(BaseAttnBackend):
         )
         self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
             self.float_workspace_buffer,
-            use_tensor_cores=self._use_tensor_cores(config),
+            use_tensor_cores=self.use_tensor_cores,
             kv_layout="NHD",
             backend="fa2",
         )
+        # Reuse the int workspace to halve pinned-host allocation.
         self.int_workspace_buffer = self.prefill_wrapper._int_workspace_buffer
         self.decode_wrapper._int_workspace_buffer = self.int_workspace_buffer
 
@@ -86,12 +106,20 @@ class FlashInferBackend(BaseAttnBackend):
         self.max_graph_bs = 0
         self.graph_wrappers: Dict[int, object] = {}
         self.capture: FICaptureData | None = None
+        # Serialize consecutive plan() calls: FlashInfer reuses a pinned staging
+        # buffer internally, so we must wait for the previous H2D copy to finish
+        # before mutating that buffer again.
         self.last_event = torch.cuda.Event()
         self.last_event.record()
 
-    @staticmethod
-    def _use_tensor_cores(config: "ModelConfig") -> bool:
-        return (config.num_qo_heads // config.num_kv_heads) >= 4
+    @cached_property
+    def use_tensor_cores(self) -> bool:
+        """Enable tensor-core path for GQA ratios >= 4; can be overridden via env."""
+        from radixinfer.env import ENV
+
+        if (override := ENV.FLASHINFER_USE_TENSOR_CORES.value) is not None:
+            return override
+        return (self.config.num_qo_heads // self.config.num_kv_heads) >= 4
 
     def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
         if metadata.initialized:
@@ -145,23 +173,19 @@ class FlashInferBackend(BaseAttnBackend):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: "Batch"
     ) -> torch.Tensor:
+        def _as_page1(cache: torch.Tensor) -> torch.Tensor:
+            # FlashInfer paged-KV expects shape (num_pages, 1, num_heads, head_dim)
+            return cache.view(-1, 1, cache.shape[2], cache.shape[3])
+
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
-        k_cache = self.kvcache.k_cache(layer_id).view(
-            -1,
-            1,
-            self.kvcache.k_cache(layer_id).shape[2],
-            self.kvcache.k_cache(layer_id).shape[3],
+        kv = (
+            _as_page1(self.kvcache.k_cache(layer_id)),
+            _as_page1(self.kvcache.v_cache(layer_id)),
         )
-        v_cache = self.kvcache.v_cache(layer_id).view(
-            -1,
-            1,
-            self.kvcache.v_cache(layer_id).shape[2],
-            self.kvcache.v_cache(layer_id).shape[3],
-        )
-        return metadata.wrapper.run(q=q, paged_kv_cache=(k_cache, v_cache))
+        return metadata.wrapper.run(q=q, paged_kv_cache=kv)
 
     def prepare_metadata(self, batch: "Batch") -> None:
         from radixinfer.core import get_global_ctx
@@ -203,15 +227,10 @@ class FlashInferBackend(BaseAttnBackend):
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None
         max_bs = max(bs_list)
-        indices = torch.zeros(max_bs * max_seq_len, dtype=torch.int32, device=self.kvcache.device)
-        self.capture = FICaptureData(
-            seq_lens=torch.ones(max_bs, dtype=torch.int32, device=self.kvcache.device),
-            positions=torch.zeros(max_bs, dtype=torch.int32, device=self.kvcache.device),
-            cu_seqlens_k=torch.arange(0, max_bs + 1, dtype=torch.int32, device=self.kvcache.device),
-            cu_seqlens_q=torch.arange(0, max_bs + 1, dtype=torch.int32, device=self.kvcache.device),
-            page_table=indices,
-            indices=indices,
-        )
+        capture = FICaptureData.create(max_bs, max_seq_len, self.kvcache.device)
+        # Flatten page_table to 1-D; the indices property aliases it.
+        capture.page_table = capture.page_table.view(-1)
+        self.capture = capture
         self.max_graph_bs = max_bs
         self.capture_bs = sorted(bs_list)
 
@@ -224,7 +243,7 @@ class FlashInferBackend(BaseAttnBackend):
         graph_wrapper = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
             self.float_workspace_buffer,
             kv_layout="NHD",
-            use_tensor_cores=self._use_tensor_cores(self.config),
+            use_tensor_cores=self.use_tensor_cores,
             indptr_buffer=capture.cu_seqlens_k[: bs + 1],
             indices_buffer=capture.indices,
             last_page_len_buffer=capture.one_tensor[:bs],

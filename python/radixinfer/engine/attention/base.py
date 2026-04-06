@@ -36,7 +36,11 @@ class BaseAttnBackend(ABC):
 
 
 class HybridBackend(BaseAttnBackend):
-    """Routes prefill/decode to different specialized backends."""
+    """Routes each forward call to a specialized backend based on batch phase.
+
+    Typical use: FA (FlashAttention) for variable-length prefill, FI (FlashInfer)
+    for fixed-shape decode — e.g. ``attention_backend="fa,fi"``.
+    """
 
     def __init__(
         self,

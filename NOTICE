@@ -1,0 +1,14 @@
+radixInfer includes code and implementation ideas derived in part from:
+
+mini-sglang
+Copyright (c) the mini-sglang authors
+Repository: https://github.com/sgl-project/mini-sglang
+License: MIT
+
+This repository contains modifications, refactors, and additional components
+built on top of upstream work. The project as a whole is distributed under the
+license stated in the repository LICENSE file, while preserving required
+upstream attribution and license notices for derived portions.
+
+If you redistribute substantial portions of code derived from the MIT-licensed
+upstream project, retain the relevant copyright and license notices.
